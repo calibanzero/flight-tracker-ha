@@ -1277,6 +1277,25 @@ function haversineKm(
   return R * c;
 }
 
+const OPENSKY_CACHE_MS = 15 * 1000;
+const OPENSKY_MIN_BACKOFF_MS = 60 * 1000;
+
+let openSkyCache = {
+  key: null,
+  timestamp: 0,
+  states: []
+};
+
+let openSkyFetchPromise = null;
+let openSkyFetchKey = null;
+let openSkyBackoffUntil = 0;
+
+function openSkyBoxKey({ lamin, lamax, lomin, lomax }) {
+  return [lamin, lamax, lomin, lomax]
+    .map(value => Number(value).toFixed(6))
+    .join(':');
+}
+
 async function fetchStatesBBox({
   lamin,
   lamax,
@@ -1303,16 +1322,33 @@ async function fetchStatesBBox({
     });
 
   if (res.status === 429) {
+    // The initial request already used one credential, so only retry for
+    // credentials we have not tried yet. This prevents wrapping around and
+    // hitting the first account a second time during the same refresh.
     const maxRetries =
       Math.max(
-        1,
-        credentialSets.length
+        0,
+        credentialSets.length - 1
       );
 
     if (retryCount >= maxRetries) {
-      throw new Error(
+      const retryAfterSeconds = Number.parseInt(
+        res.headers.get('x-rate-limit-retry-after-seconds') ||
+        res.headers.get('retry-after') ||
+        '0',
+        10
+      );
+
+      const err = new Error(
         'OpenSky rate limit reached after trying available credentials'
       );
+
+      err.retryAfterMs =
+        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? retryAfterSeconds * 1000
+          : OPENSKY_MIN_BACKOFF_MS;
+
+      throw err;
     }
 
     if (credentialSets.length > 1) {
@@ -1354,6 +1390,78 @@ async function fetchStatesBBox({
     await res.json();
 
   return json.states || [];
+}
+
+async function getOpenSkyStates(box) {
+  const now = Date.now();
+  const key = openSkyBoxKey(box);
+
+  if (
+    openSkyCache.key === key &&
+    now - openSkyCache.timestamp < OPENSKY_CACHE_MS
+  ) {
+    return openSkyCache.states;
+  }
+
+  // If another browser has already kicked off the refresh for this exact
+  // tracking area, share that request rather than making another API call.
+  if (
+    openSkyFetchPromise &&
+    openSkyFetchKey === key
+  ) {
+    return openSkyFetchPromise;
+  }
+
+  // While OpenSky has asked us to back off, keep serving the most recent
+  // states rather than repeatedly hammering a rate-limited endpoint.
+  if (now < openSkyBackoffUntil) {
+    if (openSkyCache.key === key) {
+      return openSkyCache.states;
+    }
+    return [];
+  }
+
+  openSkyFetchKey = key;
+  openSkyFetchPromise = (async () => {
+    try {
+      const states = await fetchStatesBBox(box);
+
+      openSkyCache = {
+        key,
+        timestamp: Date.now(),
+        states
+      };
+
+      openSkyBackoffUntil = 0;
+      return states;
+    } catch (err) {
+      if (err?.retryAfterMs) {
+        openSkyBackoffUntil =
+          Date.now() +
+          Math.max(
+            OPENSKY_MIN_BACKOFF_MS,
+            err.retryAfterMs
+          );
+
+        console.warn(
+          `[OpenSky] Backing off API calls for ${Math.ceil((openSkyBackoffUntil - Date.now()) / 1000)} seconds.`
+        );
+      }
+
+      // A slightly stale aircraft picture is more useful than an empty one,
+      // and lastSeenMap will continue ageing entries normally.
+      if (openSkyCache.key === key) {
+        return openSkyCache.states;
+      }
+
+      throw err;
+    } finally {
+      openSkyFetchPromise = null;
+      openSkyFetchKey = null;
+    }
+  })();
+
+  return openSkyFetchPromise;
 }
 
 // -----------------------------
@@ -1705,9 +1813,21 @@ const server =
 
             const secretValue = (entry, currentSecret) => {
               if (!entry || typeof entry !== 'object') return currentSecret;
-              if (entry.clientSecret === '••••••••') return currentSecret;
               if (entry.clientSecret == null) return currentSecret;
-              return String(entry.clientSecret);
+
+              const submittedSecret = String(entry.clientSecret);
+
+              // A blank or masked field means "leave the existing secret alone".
+              // This prevents unrelated Admin changes (such as location/radius)
+              // from accidentally wiping stored OpenSky credentials.
+              if (
+                !submittedSecret.trim() ||
+                submittedSecret === '••••••••'
+              ) {
+                return currentSecret;
+              }
+
+              return submittedSecret;
             };
 
             const next = {
@@ -2031,7 +2151,7 @@ const server =
 
           try {
             states =
-              await fetchStatesBBox(
+              await getOpenSkyStates(
                 box
               );
           } catch (err) {
