@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
@@ -858,6 +859,12 @@ async function authHeaders() {
 // ADSBDB route and aircraft lookup
 // -----------------------------
 const ADSBDB_BASE_URL = 'https://api.adsbdb.com/v0';
+
+const ADSBDB_HTTPS_AGENT =
+  new https.Agent({
+    family: 4,
+    keepAlive: true
+  });
 const ADSBDB_CACHE_MS = 30 * 60 * 1000;
 const adsbdbCache = new Map();
 const adsbdbFailureCache = new Map();
@@ -879,6 +886,7 @@ async function fetchAdsbdbJson(url, label) {
         Accept: 'application/json',
         'User-Agent': 'fernpath-flight-tracker/1.0'
       },
+      agent: ADSBDB_HTTPS_AGENT,
       signal: controller.signal
     });
 
