@@ -752,6 +752,96 @@ function loadAircraftDatabase() {
 
 loadAircraftDatabase();
 
+
+// -----------------------------
+// Load friendly aircraft type names from planes.dat
+// -----------------------------
+const planeTypes = {};
+
+try {
+  const datRaw =
+    fs.readFileSync(
+      path.join(__dirname, 'planes.dat'),
+      'utf-8'
+    );
+
+  datRaw
+    .split(/\r?\n/)
+    .forEach(line => {
+      line = line.trim();
+
+      if (
+        !line ||
+        line.startsWith('#')
+      ) {
+        return;
+      }
+
+      const parts =
+        line
+          .split(',')
+          .map(
+            p =>
+              p
+                .replace(/^"|"$/g, '')
+                .trim()
+          );
+
+      if (
+        parts.length >= 3 &&
+        parts[2]
+      ) {
+        planeTypes[
+          parts[2].toUpperCase()
+        ] = parts[0];
+      }
+    });
+
+  console.log(
+    `[PlaneTypes] Loaded ${Object.keys(planeTypes).length.toLocaleString()} friendly aircraft type mappings`
+  );
+} catch (err) {
+  console.warn(
+    '[PlaneTypes] planes.dat not found or failed to load:',
+    err.message
+  );
+}
+
+function friendlyAircraftType({
+  adsbType,
+  adsbIcaoType,
+  localMeta
+}) {
+  const localTypeCode =
+    String(
+      localMeta?.typecode ||
+      localMeta?.icao_type ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  const adsbTypeCode =
+    String(
+      adsbIcaoType ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  return (
+    planeTypes[adsbTypeCode] ||
+    planeTypes[localTypeCode] ||
+    adsbType ||
+    localMeta?.description ||
+    localMeta?.model ||
+    localMeta?.type ||
+    localTypeCode ||
+    adsbTypeCode ||
+    null
+  );
+}
+
 // -----------------------------
 // Load Airline Map
 // -----------------------------
@@ -2015,12 +2105,11 @@ const server =
                   null;
 
                 let type =
-                  acMeta.description ||
-                  acMeta.model ||
-                  acMeta.type ||
-                  acMeta.typecode ||
-                  acMeta.icao_type ||
-                  null;
+                  friendlyAircraftType({
+                    adsbType: null,
+                    adsbIcaoType: null,
+                    localMeta: acMeta
+                  });
 
                 if (flightNo && (!prev || prev.data.origin === 'Unknown' || prev.data.destination === 'Unknown')) {
                   const adsbData = await lookupAdsbdb(icao24, flightNo);
@@ -2031,8 +2120,14 @@ const server =
                       registration;
 
                     type =
-                      adsbData.type ||
-                      adsbData.icaoType ||
+                      friendlyAircraftType({
+                        adsbType:
+                          adsbData.type,
+                        adsbIcaoType:
+                          adsbData.icaoType,
+                        localMeta:
+                          acMeta
+                      }) ||
                       type;
 
                     origin = formatAdsbAirport(adsbData.origin);
