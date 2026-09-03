@@ -337,7 +337,7 @@
       <article class="card span-8">
         <div class="card-header">
           <div><h2>Flights per day</h2><p>Daily traffic through the tracking area</p></div>
-          <span class="badge">Sydney date</span>
+          <span class="badge" id="timezoneBadge">Local time</span>
         </div>
         <div class="chart-wrap"><canvas id="byDayChart"></canvas></div>
       </article>
@@ -389,17 +389,43 @@
     Chart.defaults.borderColor = colours.grid;
     Chart.defaults.font.family = 'Lexend Deca, system-ui, sans-serif';
 
-    function formatDateInput(d) {
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
+    function dateStringInTimeZone(date, timeZone) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).formatToParts(date);
+      const value = type => parts.find(part => part.type === type)?.value || '';
+      return `${value('year')}-${value('month')}-${value('day')}`;
+    }
+
+    function shiftDateString(value, days) {
+      const [y, m, d] = value.split('-').map(Number);
+      const shifted = new Date(Date.UTC(y, m - 1, d + days));
+      return [
+        shifted.getUTCFullYear(),
+        String(shifted.getUTCMonth() + 1).padStart(2, '0'),
+        String(shifted.getUTCDate()).padStart(2, '0')
+      ].join('-');
     }
 
     function prettyDate(value) {
       if (!value) return '';
       const [y, m, d] = value.split('-').map(Number);
-      return new Intl.DateTimeFormat('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(y, m - 1, d));
+      return new Intl.DateTimeFormat('en-AU', {
+        timeZone: 'UTC',
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric'
+      }).format(new Date(Date.UTC(y, m - 1, d)));
+    }
+
+    async function fetchLocalTimezone() {
+      const res = await fetch('/api/admin/settings', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`Settings request failed (${res.status})`);
+      const data = await res.json();
+      return data.settings?.display_timezone || 'Australia/Sydney';
     }
 
     function buildQuarterLabels() {
@@ -560,18 +586,19 @@
       const toInput = document.getElementById('toDate');
       const applyBtn = document.getElementById('applyDates');
       const status = document.getElementById('status');
+      const timezoneBadge = document.getElementById('timezoneBadge');
       const rangeButtons = [...document.querySelectorAll('.range-button')];
+      let analyticsTimeZone = await fetchLocalTimezone();
+      timezoneBadge.textContent = analyticsTimeZone;
 
       function setRange(days) {
-        const today = new Date();
-        toInput.value = formatDateInput(today);
+        const today = dateStringInTimeZone(new Date(), analyticsTimeZone);
+        toInput.value = today;
         if (days === 'all') {
           fromInput.value = '';
           toInput.value = '';
         } else {
-          const start = new Date(today);
-          start.setDate(start.getDate() - (Number(days) - 1));
-          fromInput.value = formatDateInput(start);
+          fromInput.value = shiftDateString(today, -(Number(days) - 1));
         }
       }
 
@@ -592,11 +619,15 @@
 
         try {
           const data = await fetchStats(fromInput.value, toInput.value);
+          if (data.timezone) {
+            analyticsTimeZone = data.timezone;
+            timezoneBadge.textContent = analyticsTimeZone;
+          }
           const total = updateSummary(data, fromInput.value, toInput.value);
           buildCharts(data);
           status.textContent = total
-            ? `Showing ${total.toLocaleString('en-AU')} logged flights${fromInput.value || toInput.value ? ' for the selected range' : ''}.`
-            : 'No logged flights found for this range.';
+            ? `Showing ${total.toLocaleString('en-AU')} logged flights${fromInput.value || toInput.value ? ' for the selected range' : ''} · ${analyticsTimeZone}.`
+            : `No logged flights found for this range · ${analyticsTimeZone}.`;
         } catch (err) {
           console.error(err);
           status.textContent = `Could not load statistics: ${err.message}`;

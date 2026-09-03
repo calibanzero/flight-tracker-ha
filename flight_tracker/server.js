@@ -96,7 +96,7 @@ function validateSettings(settings) {
     throw new Error('Polling interval must be between 5 and 3600 seconds');
   }
   if (!isValidTimeZone(settings.display_timezone)) {
-    throw new Error('Display timezone must be a valid IANA timezone, such as Australia/Sydney');
+    throw new Error('Local timezone must be a valid IANA timezone, such as Australia/Sydney');
   }
 }
 
@@ -338,89 +338,33 @@ function parseMultipart(body, contentType) {
   return parts;
 }
 
-const sydneyDateFormatter = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Australia/Sydney',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit'
-});
+const localDateFormatterCache = new Map();
+const localTimeFormatterCache = new Map();
 
-const sydneyTimeFormatter = new Intl.DateTimeFormat('en-AU', {
-  timeZone: 'Australia/Sydney',
-  hour12: false,
-  hour: '2-digit',
-  minute: '2-digit'
-});
-
-function getSydneyUtcOffsetMs(date) {
-  const parts = new Intl.DateTimeFormat('en-AU', {
-    timeZone: 'Australia/Sydney',
-    timeZoneName: 'shortOffset',
-    hour: '2-digit'
-  }).formatToParts(date);
-
-  const zone =
-    parts.find(p => p.type === 'timeZoneName')?.value || 'GMT+0';
-
-  const match = zone.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/i);
-
-  if (!match) return 0;
-
-  const sign = match[1] === '-' ? -1 : 1;
-  const hours = Number(match[2] || 0);
-  const minutes = Number(match[3] || 0);
-
-  return sign * (hours * 60 + minutes) * 60 * 1000;
+function getLocalDateFormatter(timeZone) {
+  if (!localDateFormatterCache.has(timeZone)) {
+    localDateFormatterCache.set(timeZone, new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }));
+  }
+  return localDateFormatterCache.get(timeZone);
 }
 
-function sydneyMidnightUtc(dateString) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateString || '');
-
-  if (!match) return null;
-
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-
-  // Probe around midday so we get the correct Sydney UTC offset
-  // for that calendar date, including daylight saving.
-  const probe = new Date(
-    Date.UTC(year, month - 1, day, 12, 0, 0)
-  );
-
-  const offsetMs = getSydneyUtcOffsetMs(probe);
-
-  return Date.UTC(
-    year,
-    month - 1,
-    day,
-    0,
-    0,
-    0
-  ) - offsetMs;
+function getLocalTimeFormatter(timeZone) {
+  if (!localTimeFormatterCache.has(timeZone)) {
+    localTimeFormatterCache.set(timeZone, new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }));
+  }
+  return localTimeFormatterCache.get(timeZone);
 }
 
-function nextSydneyMidnightUtc(dateString) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateString || '');
-
-  if (!match) return null;
-
-  const next = new Date(
-    Date.UTC(
-      Number(match[1]),
-      Number(match[2]) - 1,
-      Number(match[3]) + 1
-    )
-  );
-
-  const nextDateString = [
-    next.getUTCFullYear(),
-    String(next.getUTCMonth() + 1).padStart(2, '0'),
-    String(next.getUTCDate()).padStart(2, '0')
-  ].join('-');
-
-  return sydneyMidnightUtc(nextDateString);
-}
 
 const loggedAirports = new Set();
 const loggedUnknownAirlines = new Set();
@@ -1889,7 +1833,7 @@ const server =
             saveAppSettings(next);
             refreshCredentialSets();
 
-            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius), OpenSky polling every ${appSettings.poll_interval_seconds}s, display timezone ${appSettings.display_timezone}`);
+            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius), OpenSky polling every ${appSettings.poll_interval_seconds}s, local timezone ${appSettings.display_timezone}`);
 
             res.writeHead(200, {
               'content-type': 'application/json',
@@ -2534,300 +2478,87 @@ const server =
           )
         ) {
           try {
-            const urlObj =
-              new URL(
-                req.url,
-                'http://localhost'
-              );
+            const urlObj = new URL(req.url, 'http://localhost');
+            const fromParam = urlObj.searchParams.get('from');
+            const toParam = urlObj.searchParams.get('to');
+            const validDateParam = value => !value || /^\d{4}-\d{2}-\d{2}$/.test(value);
 
-            const fromParam =
-              urlObj.searchParams.get(
-                'from'
-              );
-
-            const toParam =
-              urlObj.searchParams.get(
-                'to'
-              );
-
-            let fromTs =
-              null;
-
-            let toTs =
-              null;
-
-            if (fromParam) {
-              fromTs =
-                sydneyMidnightUtc(
-                  fromParam
-                );
+            if (!validDateParam(fromParam) || !validDateParam(toParam)) {
+              throw new Error('Date filters must use YYYY-MM-DD');
             }
 
-            if (toParam) {
-              const nextMidnight =
-                nextSydneyMidnightUtc(
-                  toParam
-                );
+            const timeZone = appSettings.display_timezone;
+            const dateFormatter = getLocalDateFormatter(timeZone);
+            const timeFormatter = getLocalTimeFormatter(timeZone);
+            const localToday = dateFormatter.format(new Date());
 
-              if (
-                nextMidnight !==
-                null
-              ) {
-                toTs =
-                  nextMidnight - 1;
-              }
-            }
+            const emptyStats = () => ({
+              timezone: timeZone,
+              localToday,
+              byHour: Array.from({ length: 24 }, () => 0),
+              byQuarterHour: Array.from({ length: 96 }, () => 0),
+              flightsByAircraft: {},
+              flightsByAirline: {},
+              flightsPerDay: {}
+            });
 
-            if (
-              !fs.existsSync(
-                FLIGHT_LOG_FILE
-              )
-            ) {
-              res.writeHead(200, {
-                'content-type':
-                  'application/json'
-              });
-
-              res.end(
-                JSON.stringify({
-                  byHour:
-                    Array.from(
-                      {
-                        length: 24
-                      },
-                      () => 0
-                    ),
-                  byQuarterHour:
-                    Array.from(
-                      {
-                        length: 96
-                      },
-                      () => 0
-                    ),
-                  flightsByAircraft:
-                    {},
-                  flightsByAirline:
-                    {},
-                  flightsPerDay:
-                    {}
-                })
-              );
-
+            if (!fs.existsSync(FLIGHT_LOG_FILE)) {
+              res.writeHead(200, { 'content-type': 'application/json' });
+              res.end(JSON.stringify(emptyStats()));
               return;
             }
 
-            const csvText =
-              fs.readFileSync(
-                FLIGHT_LOG_FILE,
-                'utf8'
-              );
-
-            const parsedLog =
-              Papa.parse(
-                csvText,
-                {
-                  header: true,
-                  skipEmptyLines:
-                    true
-                }
-              );
-
-            const rows =
-              parsedLog.data ||
-              [];
-
-            const byHour =
-              Array.from(
-                {
-                  length: 24
-                },
-                () => 0
-              );
-
-            const byQuarterHour =
-              Array.from(
-                {
-                  length: 96
-                },
-                () => 0
-              );
-
-            const flightsByAircraft =
-              {};
-
-            const flightsByAirline =
-              {};
-
-            const flightsPerDay =
-              {};
+            const csvText = fs.readFileSync(FLIGHT_LOG_FILE, 'utf8');
+            const parsedLog = Papa.parse(csvText, {
+              header: true,
+              skipEmptyLines: true
+            });
+            const rows = parsedLog.data || [];
+            const stats = emptyStats();
 
             rows.forEach(r => {
-              const ts =
-                Number(
-                  r.timestamp
-                );
+              const ts = Number(r.timestamp);
+              if (Number.isNaN(ts)) return;
 
-              if (
-                Number.isNaN(
-                  ts
-                )
-              ) {
-                return;
+              const d = new Date(ts);
+              const dayKey = dateFormatter.format(d);
+
+              // Compare calendar dates after converting each flight to the
+              // configured local timezone. This remains correct across DST.
+              if (fromParam && dayKey < fromParam) return;
+              if (toParam && dayKey > toParam) return;
+
+              const timeParts = timeFormatter.formatToParts(d);
+              const h = Number(timeParts.find(p => p.type === 'hour')?.value);
+              const minute = Number(timeParts.find(p => p.type === 'minute')?.value);
+
+              if (Number.isFinite(h) && h >= 0 && h < 24) {
+                stats.byHour[h] += 1;
               }
 
-              if (
-                fromTs !==
-                  null &&
-                ts < fromTs
-              ) {
-                return;
+              if (Number.isFinite(h) && Number.isFinite(minute)) {
+                const qIdx = Math.floor((h * 60 + minute) / 15);
+                if (qIdx >= 0 && qIdx < 96) {
+                  stats.byQuarterHour[qIdx] += 1;
+                }
               }
 
-              if (
-                toTs !==
-                  null &&
-                ts > toTs
-              ) {
-                return;
-              }
+              const type = (r.type || 'Unknown').trim() || 'Unknown';
+              stats.flightsByAircraft[type] = (stats.flightsByAircraft[type] || 0) + 1;
 
-              const d =
-                new Date(ts);
+              const airline = (r.airline || 'Unknown').trim() || 'Unknown';
+              stats.flightsByAirline[airline] = (stats.flightsByAirline[airline] || 0) + 1;
 
-              const timeParts =
-                sydneyTimeFormatter
-                  .formatToParts(
-                    d
-                  );
-
-              const h =
-                Number(
-                  timeParts.find(
-                    p =>
-                      p.type ===
-                      'hour'
-                  )?.value
-                );
-
-              const minute =
-                Number(
-                  timeParts.find(
-                    p =>
-                      p.type ===
-                      'minute'
-                  )?.value
-                );
-
-              if (
-                Number.isFinite(
-                  h
-                ) &&
-                h >= 0 &&
-                h < 24
-              ) {
-                byHour[h] += 1;
-              }
-
-              const minutesOfDay =
-                h * 60 +
-                minute;
-
-              const qIdx =
-                Math.floor(
-                  minutesOfDay /
-                  15
-                );
-
-              if (
-                qIdx >= 0 &&
-                qIdx < 96
-              ) {
-                byQuarterHour[
-                  qIdx
-                ] += 1;
-              }
-
-              const type =
-                (
-                  r.type ||
-                  'Unknown'
-                ).trim() ||
-                'Unknown';
-
-              flightsByAircraft[
-                type
-              ] =
-                (
-                  flightsByAircraft[
-                    type
-                  ] || 0
-                ) + 1;
-
-              const airline =
-                (
-                  r.airline ||
-                  'Unknown'
-                ).trim() ||
-                'Unknown';
-
-              flightsByAirline[
-                airline
-              ] =
-                (
-                  flightsByAirline[
-                    airline
-                  ] || 0
-                ) + 1;
-
-              const dayKey =
-                sydneyDateFormatter
-                  .format(
-                    new Date(ts)
-                  );
-
-              flightsPerDay[
-                dayKey
-              ] =
-                (
-                  flightsPerDay[
-                    dayKey
-                  ] || 0
-                ) + 1;
+              stats.flightsPerDay[dayKey] = (stats.flightsPerDay[dayKey] || 0) + 1;
             });
 
-            res.writeHead(200, {
-              'content-type':
-                'application/json'
-            });
-
-            res.end(
-              JSON.stringify({
-                byHour,
-                byQuarterHour,
-                flightsByAircraft,
-                flightsByAirline,
-                flightsPerDay
-              })
-            );
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(stats));
           } catch (err) {
-            console.error(
-              '[Stats] Error:',
-              err.message
-            );
-
-            res.writeHead(500, {
-              'content-type':
-                'application/json'
-            });
-
-            res.end(
-              JSON.stringify({
-                error:
-                  'Failed to compute stats'
-              })
-            );
+            console.error('[Stats] Error:', err.message);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Failed to compute stats' }));
           }
-
           return;
         }
 

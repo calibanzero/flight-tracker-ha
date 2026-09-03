@@ -60,7 +60,7 @@ function routeText(flight) {
 
 function displayTime(ts) {
   const d = new Date(toMs(ts));
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { timeZone: serverClock?.timezone || undefined, hour: '2-digit', minute: '2-digit' });
 }
 
 function renderAirline(el, flight) {

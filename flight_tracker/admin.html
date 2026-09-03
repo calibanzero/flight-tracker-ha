@@ -148,7 +148,7 @@
             </div>
 
             <div>
-              <label for="displayTimezone">Day/night location</label>
+              <label for="displayTimezone">Local timezone</label>
               <input id="displayTimezone" name="display_timezone" type="text" list="timezoneSuggestions" autocomplete="off" spellcheck="false" required placeholder="Australia/Sydney">
               <datalist id="timezoneSuggestions">
                 <option value="Australia/Sydney"></option>
@@ -163,7 +163,7 @@
                 <option value="America/Los_Angeles"></option>
                 <option value="UTC"></option>
               </datalist>
-              <div class="settings-note">Timezone used for the Clear Skies day/night background. Day is 07:00–19:00 in this location. Use an IANA timezone such as Australia/Sydney.</div>
+              <div class="settings-note">Timezone used throughout Flight Tracker for Clear Skies and Analytics date/time grouping. Day is 07:00–19:00 for the Clear Skies display. Use an IANA timezone such as Australia/Sydney.</div>
             </div>
 
             <div class="settings-section">
@@ -251,6 +251,7 @@ const logStatusEl = document.getElementById('logStatus');
 const autoRefreshLogs = document.getElementById('autoRefreshLogs');
 const followLogs = document.getElementById('followLogs');
 const refreshLogsButton = document.getElementById('refreshLogs');
+let currentLocalTimezone = 'Australia/Sydney';
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 async function loadSettings(){
   try{
@@ -262,7 +263,8 @@ async function loadSettings(){
     longitudeInput.value=settings.lon;
     radiusInput.value=settings.radius_km;
     pollIntervalInput.value=settings.poll_interval_seconds||15;
-    displayTimezoneInput.value=settings.display_timezone||'Australia/Sydney';
+    currentLocalTimezone=settings.display_timezone||'Australia/Sydney';
+    displayTimezoneInput.value=currentLocalTimezone;
     const openSky=settings.openSky||{};
     const primary=openSky.primary||{};
     const backup=openSky.backup||{};
@@ -306,7 +308,8 @@ settingsForm.addEventListener('submit',async e=>{
     longitudeInput.value=data.settings.lon;
     radiusInput.value=data.settings.radius_km;
     pollIntervalInput.value=data.settings.poll_interval_seconds||15;
-    displayTimezoneInput.value=data.settings.display_timezone||'Australia/Sydney';
+    currentLocalTimezone=data.settings.display_timezone||'Australia/Sydney';
+    displayTimezoneInput.value=currentLocalTimezone;
     primaryClientSecretInput.value='';
     backupClientSecretInput.value='';
     const primary=data.settings.openSky?.primary||{};
@@ -323,14 +326,14 @@ settingsForm.addEventListener('submit',async e=>{
   }
 });
 
-function formatLogTime(timestamp){const d=new Date(timestamp);if(Number.isNaN(d.getTime()))return timestamp||'';return d.toLocaleString('en-AU',{timeZone:'Australia/Sydney',year:'2-digit',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});}
-async function loadLogs(){try{const res=await fetch('/api/logs?limit=500',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();const logs=data.logs||[];logsEl.innerHTML=!logs.length?'<div class="empty">No application log messages yet.</div>':logs.map(entry=>{const level=entry.level==='error'?'log-error':entry.level==='warn'?'log-warn':'';const label=String(entry.level||'log').toUpperCase().padEnd(5,' ');return `<div class="log-line ${level}"><span class="log-time">${escapeHtml(formatLogTime(entry.timestamp))}</span> ${escapeHtml(label)} ${escapeHtml(entry.message||'')}</div>`;}).join('');logStatusEl.textContent=`${logs.length} entries · updated ${new Date().toLocaleTimeString('en-AU')}`;if(followLogs.checked)logsEl.scrollTop=logsEl.scrollHeight;}catch(err){logStatusEl.textContent=`Log refresh failed: ${err.message}`;}}
+function formatLogTime(timestamp){const d=new Date(timestamp);if(Number.isNaN(d.getTime()))return timestamp||'';return d.toLocaleString('en-AU',{timeZone:currentLocalTimezone,year:'2-digit',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});}
+async function loadLogs(){try{const res=await fetch('/api/logs?limit=500',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();const logs=data.logs||[];logsEl.innerHTML=!logs.length?'<div class="empty">No application log messages yet.</div>':logs.map(entry=>{const level=entry.level==='error'?'log-error':entry.level==='warn'?'log-warn':'';const label=String(entry.level||'log').toUpperCase().padEnd(5,' ');return `<div class="log-line ${level}"><span class="log-time">${escapeHtml(formatLogTime(entry.timestamp))}</span> ${escapeHtml(label)} ${escapeHtml(entry.message||'')}</div>`;}).join('');logStatusEl.textContent=`${logs.length} entries · updated ${new Date().toLocaleTimeString('en-AU',{timeZone:currentLocalTimezone})}`;if(followLogs.checked)logsEl.scrollTop=logsEl.scrollHeight;}catch(err){logStatusEl.textContent=`Log refresh failed: ${err.message}`;}}
 refreshLogsButton.addEventListener('click',loadLogs);setInterval(()=>{if(autoRefreshLogs.checked)loadLogs();},5000);
 function previewFile(file){if(!file)return;const url=URL.createObjectURL(file);dropZone.innerHTML=`Selected: <strong>${file.name}</strong><img src="${url}" alt="Preview">`;}
 fileInput.addEventListener('change',()=>previewFile(fileInput.files[0]));['dragenter','dragover'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.add('drag');}));['dragleave','drop'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.remove('drag');}));dropZone.addEventListener('drop',e=>{const file=e.dataTransfer.files[0];if(!file)return;const dt=new DataTransfer();dt.items.add(file);fileInput.files=dt.files;previewFile(file);});
 async function loadMissing(){const res=await fetch('/api/admin/backgrounds');const data=await res.json();const list=document.getElementById('missing');document.getElementById('missingCount').textContent=`(${data.missing.length})`;if(!data.missing.length){list.innerHTML='<div class="empty">Everything discovered so far has a background. Nicely civilised.</div>';return;}list.innerHTML='';for(const ap of data.missing){const row=document.createElement('div');row.className='airport';const code=document.createElement('div');code.className='airport-code';code.textContent=ap.code;const name=document.createElement('div');name.className='airport-name';name.textContent=ap.details||'Unknown location';const btn=document.createElement('button');btn.type='button';btn.textContent='Add image';btn.addEventListener('click',()=>{codeInput.value=ap.code;fileInput.click();window.scrollTo({top:0,behavior:'smooth'});});row.append(code,name,btn);list.appendChild(row);}}
 form.addEventListener('submit',async e=>{e.preventDefault();statusEl.textContent='';statusEl.className='status';uploadButton.disabled=true;try{const fd=new FormData(form);const res=await fetch('/api/admin/backgrounds/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');statusEl.textContent=`${data.code} background saved as ${data.filename}`;statusEl.classList.add('ok');await loadMissing();}catch(err){statusEl.textContent=err.message;statusEl.classList.add('bad');}finally{uploadButton.disabled=false;}});
-loadSettings();loadMissing().catch(err=>{document.getElementById('missing').innerHTML=`<div class="bad">${err.message}</div>`;});loadLogs();
+loadSettings().finally(loadLogs);loadMissing().catch(err=>{document.getElementById('missing').innerHTML=`<div class="bad">${err.message}</div>`;});
 </script>
 </body>
 </html>
