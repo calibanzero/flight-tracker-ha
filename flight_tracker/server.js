@@ -856,7 +856,7 @@ async function fetchStatesBBox({
   lamax,
   lomin,
   lomax
-}) {
+}, retryCount = 0) {
   const qs =
     new URLSearchParams({
       lamin,
@@ -877,19 +877,27 @@ async function fetchStatesBBox({
     });
 
   if (res.status === 429) {
-    console.warn(
-      '[OpenSky] 429 Too Many Requests. Switching credentials...'
-    );
+    const maxRetries = Math.max(1, credentialSets.length);
 
-    currentCredIndex =
-      (
-        currentCredIndex + 1
-      ) %
-      credentialSets.length;
+    if (retryCount >= maxRetries) {
+      throw new Error('OpenSky rate limit reached after trying available credentials');
+    }
 
-    console.log(
-      `[OpenSky] Now using credential set #${currentCredIndex + 1}`
-    );
+    if (credentialSets.length > 1) {
+      currentCredIndex =
+        (
+          currentCredIndex + 1
+        ) %
+        credentialSets.length;
+
+      console.warn(
+        `[OpenSky] 429 Too Many Requests. Switching to credential set #${currentCredIndex + 1}...`
+      );
+    } else {
+      console.warn(
+        '[OpenSky] 429 Too Many Requests. Retrying once before backing off.'
+      );
+    }
 
     authToken = null;
 
@@ -898,7 +906,7 @@ async function fetchStatesBBox({
       lamax,
       lomin,
       lomax
-    });
+    }, retryCount + 1);
   }
 
   if (!res.ok) {
@@ -1579,9 +1587,9 @@ const server =
 
           const box =
             bboxAround(
-              trackerSettings.lat,
-              trackerSettings.lon,
-              trackerSettings.radius_km
+              appSettings.lat,
+              appSettings.lon,
+              appSettings.radius_km
             );
 
           let states = [];
@@ -1616,12 +1624,12 @@ const server =
 
                 if (
                   haversineKm(
-                    trackerSettings.lat,
-                    trackerSettings.lon,
+                    appSettings.lat,
+                    appSettings.lon,
                     s[6],
                     s[5]
                   ) >
-                  trackerSettings.radius_km
+                  appSettings.radius_km
                 ) {
                   return;
                 }
@@ -1873,11 +1881,11 @@ const server =
           res.end(
             JSON.stringify({
               centre: {
-                lat: trackerSettings.lat,
-                lon: trackerSettings.lon
+                lat: appSettings.lat,
+                lon: appSettings.lon
               },
               radius_km:
-                trackerSettings.radius_km,
+                appSettings.radius_km,
               count:
                 result.length,
               aircraft:
@@ -2280,23 +2288,21 @@ server.listen(
 // -----------------------------
 // Graceful shutdown
 // -----------------------------
-process.on(
-  'SIGINT',
-  async () => {
-    try {
-      if (browserPromise) {
-        const browser =
-          await browserPromise;
+function shutdown(signal) {
+  console.log(`[Shutdown] ${signal} received`);
 
-        await browser.close();
-      }
-    } catch (err) {
-      console.error(
-        'Error closing application:',
-        err.message
-      );
+  server.close(err => {
+    if (err) {
+      console.error('[Shutdown] Error closing server:', err.message);
+      process.exit(1);
+      return;
     }
 
-    process.exit();
-  }
-);
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
