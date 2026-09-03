@@ -1,9 +1,9 @@
 services:
-  flight-tracker:
+  flight-tracker-adsbdb-test:
     build: .
-    container_name: flight-tracker
+    container_name: flight-tracker-adsbdb-test
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3002:3002"
     volumes:
       - ./data:/data

@@ -4,7 +4,11 @@ const path = require('path');
 const Papa = require('papaparse');
 const fetch = require('node-fetch');
 
-const PORT = 3000;
+const PORT = 3002;
+
+// Persistent data directory. Declare this before any paths that depend on it.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // Persistent application settings.
 // These live in DATA_DIR so they survive container restarts and Home Assistant updates.
@@ -144,9 +148,6 @@ function captureAppLog(level, args) {
 // -----------------------------
 // Log files and in-memory sets
 // -----------------------------
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
 const AIRPORTS_FILE = path.join(DATA_DIR, 'airports.txt');
 const UNKNOWN_AIRLINES_FILE = path.join(DATA_DIR, 'unknown_airlines.txt');
 const FLIGHT_LOG_FILE = path.join(DATA_DIR, 'flight_log.csv');
@@ -604,6 +605,9 @@ function makeAirportLine(value) {
 // Load OpenSky credentials from persistent Admin settings
 // -----------------------------
 let credentialSets = [];
+let currentCredIndex = 0;
+let authToken = null;
+let tokenExpiry = 0;
 
 function refreshCredentialSets() {
   const configured = [

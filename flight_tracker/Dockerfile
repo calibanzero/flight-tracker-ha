@@ -15,6 +15,6 @@ COPY . .
 
 RUN mkdir -p /data /data/bgs
 
-EXPOSE 3000
+EXPOSE 3002
 
 CMD ["node", "server.js"]

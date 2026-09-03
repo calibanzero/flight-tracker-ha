@@ -16,7 +16,7 @@ A lightweight live aircraft tracker using OpenSky for live aircraft positions an
 
 This is packaged as a Home Assistant app (formerly called an add-on). The Node.js runtime runs inside the app container, not on the Home Assistant host. Home Assistant supports containerised apps and aarch64 builds.
 
-After installation, open the web interface on port 3000 and use **Admin** to set the tracker location and OpenSky credentials.
+After installation, open the web interface on port 3002 and use **Admin** to set the tracker location and OpenSky credentials.
 
 ADSBDB's public GET API does not require an API key.
 
