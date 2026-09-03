@@ -1,0 +1,16 @@
+name: Flight Tracker
+version: "1.0.0"
+slug: flight_tracker
+description: Live aircraft tracker using OpenSky for positions and ADSBDB for aircraft and route data.
+startup: application
+init: false
+arch:
+  - aarch64
+  - amd64
+ports:
+  3000/tcp: 3000
+ports_description:
+  3000/tcp: Flight Tracker web interface
+webui: http://[HOST]:[PORT:3000]
+watchdog: http://[HOST]:[PORT:3000]/api/health
+stage: experimental
