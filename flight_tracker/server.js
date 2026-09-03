@@ -607,6 +607,150 @@ function makeAirportLine(value) {
 }
 
 
+
+// -----------------------------
+// Load Aircraft Database
+// Supports both tar1090/readsb semicolon format and the legacy OpenSky CSV.
+// -----------------------------
+const AIRCRAFT_DB_FILE = path.join(__dirname, 'aircraftDatabase.csv');
+const aircraftDb = {};
+
+function loadAircraftDatabase() {
+  let csvRaw;
+
+  try {
+    csvRaw = fs
+      .readFileSync(AIRCRAFT_DB_FILE, 'utf-8')
+      .replace(/^\uFEFF/, '');
+  } catch (err) {
+    console.error(
+      '[AircraftDB] Failed to read aircraftDatabase.csv:',
+      err.message
+    );
+    return;
+  }
+
+  const firstDataLine =
+    csvRaw
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(
+        line =>
+          line &&
+          !line.startsWith('#')
+      ) || '';
+
+  // tar1090/readsb:
+  // ICAO;Registration;Type;Flags;Description;Year;Owner/Operator
+  if (firstDataLine.includes(';')) {
+    const parsed =
+      Papa.parse(
+        csvRaw,
+        {
+          delimiter: ';',
+          header: false,
+          skipEmptyLines: true,
+          comments: '#'
+        }
+      );
+
+    let loaded = 0;
+
+    parsed.data.forEach(row => {
+      if (
+        !Array.isArray(row) ||
+        row.length < 3
+      ) {
+        return;
+      }
+
+      const icao24 =
+        String(row[0] || '')
+          .trim()
+          .toLowerCase();
+
+      if (!/^[0-9a-f]{6}$/.test(icao24)) {
+        return;
+      }
+
+      aircraftDb[icao24] = {
+        registration:
+          String(row[1] || '').trim() ||
+          null,
+        typecode:
+          String(row[2] || '').trim() ||
+          null,
+        description:
+          String(row[4] || '').trim() ||
+          null,
+        year:
+          String(row[5] || '').trim() ||
+          null,
+        owner:
+          String(row[6] || '').trim() ||
+          null,
+        source: 'tar1090'
+      };
+
+      loaded += 1;
+    });
+
+    console.log(
+      `[AircraftDB] Loaded ${loaded.toLocaleString()} aircraft from tar1090/readsb database`
+    );
+
+    return;
+  }
+
+  // Legacy OpenSky CSV fallback.
+  const cleaned =
+    csvRaw
+      .split('\n')
+      .filter(
+        line =>
+          !line.startsWith('#')
+      )
+      .join('\n');
+
+  const parsed =
+    Papa.parse(
+      cleaned,
+      {
+        header: true,
+        skipEmptyLines: true,
+        quoteChar: `'`,
+        transformHeader:
+          h =>
+            h
+              .replace(/'/g, '')
+              .trim()
+      }
+    );
+
+  let loaded = 0;
+
+  parsed.data.forEach(row => {
+    if (!row.icao24) return;
+
+    aircraftDb[
+      String(row.icao24)
+        .trim()
+        .toLowerCase()
+    ] = {
+      ...row,
+      source: 'opensky'
+    };
+
+    loaded += 1;
+  });
+
+  console.log(
+    `[AircraftDB] Loaded ${loaded.toLocaleString()} aircraft from legacy OpenSky database`
+  );
+}
+
+loadAircraftDatabase();
+
 // -----------------------------
 // Load Airline Map
 // -----------------------------
@@ -831,6 +975,18 @@ async function lookupAdsbdb(icao24, callsign) {
       routeUrl,
       `callsign ${cleanCallsign}`
     );
+
+  if (aircraftResult.status === 404) {
+    console.warn(
+      `[ADSBDB] No aircraft record for ${modeS}`
+    );
+  }
+
+  if (routeResult.status === 404) {
+    console.warn(
+      `[ADSBDB] No route record for ${cleanCallsign}`
+    );
+  }
 
   const aircraft =
     aircraftResult.data?.response?.aircraft ||
@@ -1837,18 +1993,40 @@ const server =
                     ? callsign.replace(/\s+/g, '')
                     : null;
 
+                const acMeta =
+                  aircraftDb[icao24] ||
+                  {};
+
                 let airline = null;
                 let origin = 'Unknown';
                 let destination = 'Unknown';
-                let registration = null;
-                let type = null;
+
+                let registration =
+                  acMeta.registration ||
+                  acMeta.Registration ||
+                  null;
+
+                let type =
+                  acMeta.description ||
+                  acMeta.model ||
+                  acMeta.type ||
+                  acMeta.typecode ||
+                  acMeta.icao_type ||
+                  null;
 
                 if (flightNo && (!prev || prev.data.origin === 'Unknown' || prev.data.destination === 'Unknown')) {
                   const adsbData = await lookupAdsbdb(icao24, flightNo);
 
                   if (adsbData) {
-                    registration = adsbData.registration;
-                    type = adsbData.type;
+                    registration =
+                      adsbData.registration ||
+                      registration;
+
+                    type =
+                      adsbData.type ||
+                      adsbData.icaoType ||
+                      type;
+
                     origin = formatAdsbAirport(adsbData.origin);
                     destination = formatAdsbAirport(adsbData.destination);
 
