@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   lon: 151.2153,
   radius_km: 1.5,
   poll_interval_seconds: 15,
+  display_timezone: 'Australia/Sydney',
   openSky: {
     primary: { clientId: '', clientSecret: '' },
     backup: { clientId: '', clientSecret: '' }
@@ -45,6 +46,7 @@ function normaliseSettings(raw) {
     lon: Number(source.lon ?? DEFAULT_SETTINGS.lon),
     radius_km: Number(source.radius_km ?? DEFAULT_SETTINGS.radius_km),
     poll_interval_seconds: Number(source.poll_interval_seconds ?? DEFAULT_SETTINGS.poll_interval_seconds),
+    display_timezone: String(source.display_timezone || DEFAULT_SETTINGS.display_timezone).trim(),
     openSky: {
       primary: {
         clientId: String(primary.clientId || ''),
@@ -56,6 +58,28 @@ function normaliseSettings(raw) {
       }
     }
   };
+}
+
+function isValidTimeZone(value) {
+  try {
+    new Intl.DateTimeFormat('en-AU', { timeZone: value }).format(new Date());
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function minutesSinceMidnightInTimeZone(timeZone, date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(date);
+  const hour = Number(parts.find(part => part.type === 'hour')?.value);
+  const minute = Number(parts.find(part => part.type === 'minute')?.value);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return 0;
+  return hour * 60 + minute;
 }
 
 function validateSettings(settings) {
@@ -70,6 +94,9 @@ function validateSettings(settings) {
   }
   if (!Number.isFinite(settings.poll_interval_seconds) || settings.poll_interval_seconds < 5 || settings.poll_interval_seconds > 3600) {
     throw new Error('Polling interval must be between 5 and 3600 seconds');
+  }
+  if (!isValidTimeZone(settings.display_timezone)) {
+    throw new Error('Display timezone must be a valid IANA timezone, such as Australia/Sydney');
   }
 }
 
@@ -101,6 +128,7 @@ function publicSettings() {
     lon: appSettings.lon,
     radius_km: appSettings.radius_km,
     poll_interval_seconds: appSettings.poll_interval_seconds,
+    display_timezone: appSettings.display_timezone,
     openSky: {
       primary: {
         clientId: appSettings.openSky.primary.clientId,
@@ -1845,6 +1873,7 @@ const server =
               lon: incoming.lon,
               radius_km: incoming.radius_km,
               poll_interval_seconds: incoming.poll_interval_seconds,
+              display_timezone: incoming.display_timezone,
               openSky: {
                 primary: {
                   clientId: String(openSkyIncoming.primary?.clientId || ''),
@@ -1860,7 +1889,7 @@ const server =
             saveAppSettings(next);
             refreshCredentialSets();
 
-            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius), OpenSky polling every ${appSettings.poll_interval_seconds}s`);
+            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius), OpenSky polling every ${appSettings.poll_interval_seconds}s, display timezone ${appSettings.display_timezone}`);
 
             res.writeHead(200, {
               'content-type': 'application/json',
@@ -2481,11 +2510,13 @@ const server =
                 appSettings.radius_km,
               poll_interval_seconds:
                 appSettings.poll_interval_seconds,
+              display_timezone:
+                appSettings.display_timezone,
               server_time: {
                 epoch_ms: Date.now(),
+                timezone: appSettings.display_timezone,
                 minutes_since_midnight:
-                  new Date().getHours() * 60 +
-                  new Date().getMinutes()
+                  minutesSinceMidnightInTimeZone(appSettings.display_timezone)
               },
               count:
                 result.length,

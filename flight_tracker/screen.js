@@ -81,7 +81,7 @@ function updateServerClock(value) {
   const epochMs = Number(value?.epoch_ms);
   const minutesSinceMidnight = Number(value?.minutes_since_midnight);
   if (Number.isFinite(epochMs) && Number.isFinite(minutesSinceMidnight)) {
-    serverClock = { epochMs, minutesSinceMidnight };
+    serverClock = { epochMs, minutesSinceMidnight, timezone: value?.timezone || '' };
   }
 }
 

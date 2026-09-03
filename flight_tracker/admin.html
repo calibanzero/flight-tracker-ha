@@ -147,6 +147,25 @@
               <div class="settings-note">15 seconds = up to 5,760 fresh calls/day. 23 seconds = about 3,757/day.</div>
             </div>
 
+            <div>
+              <label for="displayTimezone">Day/night location</label>
+              <input id="displayTimezone" name="display_timezone" type="text" list="timezoneSuggestions" autocomplete="off" spellcheck="false" required placeholder="Australia/Sydney">
+              <datalist id="timezoneSuggestions">
+                <option value="Australia/Sydney"></option>
+                <option value="Australia/Melbourne"></option>
+                <option value="Australia/Brisbane"></option>
+                <option value="Australia/Perth"></option>
+                <option value="Pacific/Auckland"></option>
+                <option value="Asia/Tokyo"></option>
+                <option value="Asia/Singapore"></option>
+                <option value="Europe/London"></option>
+                <option value="America/New_York"></option>
+                <option value="America/Los_Angeles"></option>
+                <option value="UTC"></option>
+              </datalist>
+              <div class="settings-note">Timezone used for the Clear Skies day/night background. Day is 07:00–19:00 in this location. Use an IANA timezone such as Australia/Sydney.</div>
+            </div>
+
             <div class="settings-section">
               <h3>OpenSky primary account</h3>
               <p>Used for live aircraft positions. The secret is stored on the server and is never returned to the browser in plain text.</p>
@@ -215,6 +234,7 @@ const latitudeInput = document.getElementById('latitude');
 const longitudeInput = document.getElementById('longitude');
 const radiusInput = document.getElementById('radius');
 const pollIntervalInput = document.getElementById('pollInterval');
+const displayTimezoneInput = document.getElementById('displayTimezone');
 const settingsStatus = document.getElementById('settingsStatus');
 const saveSettingsButton = document.getElementById('saveSettingsButton');
 const primaryClientIdInput = document.getElementById('primaryClientId');
@@ -242,6 +262,7 @@ async function loadSettings(){
     longitudeInput.value=settings.lon;
     radiusInput.value=settings.radius_km;
     pollIntervalInput.value=settings.poll_interval_seconds||15;
+    displayTimezoneInput.value=settings.display_timezone||'Australia/Sydney';
     const openSky=settings.openSky||{};
     const primary=openSky.primary||{};
     const backup=openSky.backup||{};
@@ -268,6 +289,7 @@ settingsForm.addEventListener('submit',async e=>{
       lon:Number(longitudeInput.value),
       radius_km:Number(radiusInput.value),
       poll_interval_seconds:Number(pollIntervalInput.value),
+      display_timezone:displayTimezoneInput.value.trim(),
       openSky:{
         primary:{clientId:primaryClientIdInput.value.trim(),clientSecret:primaryClientSecretInput.value},
         backup:{clientId:backupClientIdInput.value.trim(),clientSecret:backupClientSecretInput.value}
@@ -284,6 +306,7 @@ settingsForm.addEventListener('submit',async e=>{
     longitudeInput.value=data.settings.lon;
     radiusInput.value=data.settings.radius_km;
     pollIntervalInput.value=data.settings.poll_interval_seconds||15;
+    displayTimezoneInput.value=data.settings.display_timezone||'Australia/Sydney';
     primaryClientSecretInput.value='';
     backupClientSecretInput.value='';
     const primary=data.settings.openSky?.primary||{};
