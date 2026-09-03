@@ -1,8 +1,13 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const dns = require('dns');
 const Papa = require('papaparse');
 const fetch = require('node-fetch');
+
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const PORT = 3002;
 
@@ -601,6 +606,35 @@ function makeAirportLine(value) {
   return null;
 }
 
+
+// -----------------------------
+// Load Airline Map
+// -----------------------------
+let airlineMap = {};
+
+function loadAirlineMap() {
+  try {
+    const raw = fs.readFileSync(
+      path.join(__dirname, 'airlineMap.json'),
+      'utf-8'
+    );
+
+    airlineMap = JSON.parse(raw);
+
+    console.log(
+      `[Airlines] Loaded ${Object.keys(airlineMap).length.toLocaleString()} airline mappings`
+    );
+  } catch (err) {
+    airlineMap = {};
+    console.error(
+      '[Airlines] Failed to load airlineMap.json:',
+      err.message
+    );
+  }
+}
+
+loadAirlineMap();
+
 // -----------------------------
 // Load OpenSky credentials from persistent Admin settings
 // -----------------------------
@@ -688,92 +722,226 @@ function normaliseCallsign(value) {
   return String(value || '').replace(/\s+/g, '').trim().toUpperCase();
 }
 
+async function fetchAdsbdbJson(url, label) {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(
+    () => controller.abort(),
+    10000
+  );
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'fernpath-flight-tracker/1.0'
+      },
+      signal: controller.signal
+    });
+
+    if (res.status === 429) {
+      console.warn(
+        `[ADSBDB] Rate limit reached for ${label}. Backing off.`
+      );
+      return { status: 429, data: null };
+    }
+
+    if (res.status === 404) {
+      return { status: 404, data: null };
+    }
+
+    if (!res.ok) {
+      console.warn(
+        `[ADSBDB] ${label} lookup returned HTTP ${res.status} ${res.statusText}`
+      );
+      return { status: res.status, data: null };
+    }
+
+    const data = await res.json();
+    return { status: res.status, data };
+  } catch (err) {
+    const details = [
+      err?.name,
+      err?.type,
+      err?.code,
+      err?.errno,
+      err?.message,
+      err?.cause?.code,
+      err?.cause?.message
+    ]
+      .filter(Boolean)
+      .join(' | ');
+
+    console.error(
+      `[ADSBDB] ${label} request failed: ${details || String(err)}`
+    );
+
+    return { status: 0, data: null };
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 async function lookupAdsbdb(icao24, callsign) {
   const modeS = String(icao24 || '').trim().toUpperCase();
   const cleanCallsign = normaliseCallsign(callsign);
-  if (!modeS || !/^[0-9A-F]{6}$/.test(modeS) || !cleanCallsign) {
+
+  if (
+    !modeS ||
+    !/^[0-9A-F]{6}$/.test(modeS) ||
+    !cleanCallsign
+  ) {
     return null;
   }
 
   const cacheKey = `${modeS}:${cleanCallsign}`;
   const now = Date.now();
+
   const cached = adsbdbCache.get(cacheKey);
-  if (cached && now - cached.timestamp < ADSBDB_CACHE_MS) {
+  if (
+    cached &&
+    now - cached.timestamp < ADSBDB_CACHE_MS
+  ) {
     return cached.data;
   }
 
   const failed = adsbdbFailureCache.get(cacheKey);
-  if (failed && now - failed < 5 * 60 * 1000) {
+  if (
+    failed &&
+    now - failed < 5 * 60 * 1000
+  ) {
     return null;
   }
 
-  const url = `${ADSBDB_BASE_URL}/aircraft/${encodeURIComponent(modeS)}?callsign=${encodeURIComponent(cleanCallsign)}`;
+  const aircraftUrl =
+    `${ADSBDB_BASE_URL}/aircraft/${encodeURIComponent(modeS)}`;
 
-  try {
-    const res = await fetch(url, {
-      headers: { Accept: 'application/json' },
-      timeout: 10000
-    });
+  const routeUrl =
+    `${ADSBDB_BASE_URL}/callsign/${encodeURIComponent(cleanCallsign)}`;
 
-    if (res.status === 429) {
-      console.warn('[ADSBDB] Rate limit reached. Backing off for 60 seconds.');
-      adsbdbFailureCache.set(cacheKey, now);
-      return null;
-    }
+  // Keep these sequential rather than Promise.all so a burst of nearby aircraft
+  // does not double the instantaneous request rate to ADSBDB.
+  const aircraftResult =
+    await fetchAdsbdbJson(
+      aircraftUrl,
+      `aircraft ${modeS}`
+    );
 
-    if (!res.ok) {
-      if (res.status !== 404) {
-        console.warn(`[ADSBDB] Lookup failed for ${cleanCallsign}: ${res.status}`);
-      }
-      adsbdbFailureCache.set(cacheKey, now);
-      return null;
-    }
+  const routeResult =
+    await fetchAdsbdbJson(
+      routeUrl,
+      `callsign ${cleanCallsign}`
+    );
 
-    const payload = await res.json();
-    const response = payload?.response;
-    if (!response || typeof response !== 'object') {
-      adsbdbFailureCache.set(cacheKey, now);
-      return null;
-    }
+  const aircraft =
+    aircraftResult.data?.response?.aircraft ||
+    {};
 
-    const aircraft = response.aircraft || {};
-    const route = response.flightroute || {};
-    const origin = route.origin;
-    const destination = route.destination;
-    const airline = route.airline;
+  const route =
+    routeResult.data?.response?.flightroute ||
+    {};
 
-    const data = {
-      registration: aircraft.registration || null,
-      type: aircraft.type || aircraft.icao_type || null,
-      icaoType: aircraft.icao_type || null,
-      airline: airline ? {
-        name: airline.name || null,
-        icao: airline.icao || null,
-        iata: airline.iata || null
-      } : null,
-      origin: origin ? {
-        iata: origin.iata_code || null,
-        icao: origin.icao_code || null,
-        name: origin.name || null,
-        municipality: origin.municipality || null,
-        country: origin.country_name || null
-      } : null,
-      destination: destination ? {
-        iata: destination.iata_code || null,
-        icao: destination.icao_code || null,
-        name: destination.name || null,
-        municipality: destination.municipality || null,
-        country: destination.country_name || null
-      } : null
-    };
+  const origin = route.origin || null;
+  const destination = route.destination || null;
+  const routeAirline = route.airline || null;
 
-    adsbdbCache.set(cacheKey, { timestamp: now, data });
-    return data;
-  } catch (err) {
-    console.error(`[ADSBDB] Error for ${cleanCallsign}:`, err.message);
+  const hasUsefulData =
+    Boolean(
+      aircraft.registration ||
+      aircraft.type ||
+      aircraft.icao_type ||
+      origin ||
+      destination ||
+      routeAirline
+    );
+
+  if (!hasUsefulData) {
+    // Only cache genuine failures. A simple 404 is also cached briefly so we
+    // do not hammer ADSBDB repeatedly for an unknown aircraft/callsign.
     adsbdbFailureCache.set(cacheKey, now);
     return null;
   }
+
+  const data = {
+    registration:
+      aircraft.registration ||
+      null,
+
+    type:
+      aircraft.type ||
+      aircraft.icao_type ||
+      null,
+
+    icaoType:
+      aircraft.icao_type ||
+      null,
+
+    airline:
+      routeAirline
+        ? {
+            name:
+              routeAirline.name ||
+              null,
+            icao:
+              routeAirline.icao ||
+              null,
+            iata:
+              routeAirline.iata ||
+              null
+          }
+        : null,
+
+    origin:
+      origin
+        ? {
+            iata:
+              origin.iata_code ||
+              null,
+            icao:
+              origin.icao_code ||
+              null,
+            name:
+              origin.name ||
+              null,
+            municipality:
+              origin.municipality ||
+              null,
+            country:
+              origin.country_name ||
+              null
+          }
+        : null,
+
+    destination:
+      destination
+        ? {
+            iata:
+              destination.iata_code ||
+              null,
+            icao:
+              destination.icao_code ||
+              null,
+            name:
+              destination.name ||
+              null,
+            municipality:
+              destination.municipality ||
+              null,
+            country:
+              destination.country_name ||
+              null
+          }
+        : null
+  };
+
+  adsbdbCache.set(
+    cacheKey,
+    {
+      timestamp: now,
+      data
+    }
+  );
+
+  return data;
 }
 
 function formatAdsbAirport(airport) {
@@ -877,10 +1045,16 @@ async function fetchStatesBBox({
     });
 
   if (res.status === 429) {
-    const maxRetries = Math.max(1, credentialSets.length);
+    const maxRetries =
+      Math.max(
+        1,
+        credentialSets.length
+      );
 
     if (retryCount >= maxRetries) {
-      throw new Error('OpenSky rate limit reached after trying available credentials');
+      throw new Error(
+        'OpenSky rate limit reached after trying available credentials'
+      );
     }
 
     if (credentialSets.length > 1) {
@@ -901,12 +1075,15 @@ async function fetchStatesBBox({
 
     authToken = null;
 
-    return fetchStatesBBox({
-      lamin,
-      lamax,
-      lomin,
-      lomax
-    }, retryCount + 1);
+    return fetchStatesBBox(
+      {
+        lamin,
+        lamax,
+        lomin,
+        lomax
+      },
+      retryCount + 1
+    );
   }
 
   if (!res.ok) {
@@ -2293,7 +2470,10 @@ function shutdown(signal) {
 
   server.close(err => {
     if (err) {
-      console.error('[Shutdown] Error closing server:', err.message);
+      console.error(
+        '[Shutdown] Error closing server:',
+        err.message
+      );
       process.exit(1);
       return;
     }
@@ -2301,8 +2481,18 @@ function shutdown(signal) {
     process.exit(0);
   });
 
-  setTimeout(() => process.exit(1), 5000).unref();
+  setTimeout(
+    () => process.exit(1),
+    5000
+  ).unref();
 }
 
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once(
+  'SIGINT',
+  () => shutdown('SIGINT')
+);
+
+process.once(
+  'SIGTERM',
+  () => shutdown('SIGTERM')
+);
