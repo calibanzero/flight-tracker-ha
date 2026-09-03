@@ -1,5 +1,7 @@
 const ACTIVE_WINDOW_MS = 5 * 60 * 1000;
-const POLL_MS = 15000;
+let pollMs = 15000;
+let pollTimer = null;
+let serverClock = null;
 
 let currentFlight = null;
 let currentBgCode = null;
@@ -75,13 +77,19 @@ function renderAirline(el, flight) {
   el.appendChild(span);
 }
 
+function updateServerClock(value) {
+  const epochMs = Number(value?.epoch_ms);
+  const minutesSinceMidnight = Number(value?.minutes_since_midnight);
+  if (Number.isFinite(epochMs) && Number.isFinite(minutesSinceMidnight)) {
+    serverClock = { epochMs, minutesSinceMidnight };
+  }
+}
+
 function serverHour() {
-  const hour = new Intl.DateTimeFormat('en-AU', {
-    timeZone: 'Australia/Sydney',
-    hour: '2-digit',
-    hour12: false
-  }).format(new Date());
-  return Number.parseInt(hour, 10);
+  if (!serverClock) return new Date().getHours();
+  const elapsedMinutes = Math.floor((Date.now() - serverClock.epochMs) / 60000);
+  const minuteOfDay = ((serverClock.minutesSinceMidnight + elapsedMinutes) % 1440 + 1440) % 1440;
+  return Math.floor(minuteOfDay / 60);
 }
 
 function setClearSkyBackground() {
@@ -171,6 +179,11 @@ async function fetchLatest() {
     const res = await fetch('/api/traffic', { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
+    updateServerClock(json.server_time);
+    const configuredPoll = Number(json.poll_interval_seconds);
+    if (Number.isFinite(configuredPoll)) {
+      pollMs = Math.max(5000, configuredPoll * 1000);
+    }
     const aircraft = Array.isArray(json.aircraft) ? json.aircraft : [];
     if (!aircraft.length) {
       applyState(currentFlight);
@@ -181,12 +194,14 @@ async function fetchLatest() {
   } catch (err) {
     console.error('Error fetching latest flight', err);
     applyState(currentFlight);
+  } finally {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(fetchLatest, pollMs);
   }
 }
 
 document.getElementById('homeHotspot').addEventListener('click', () => { window.location.href = '/'; });
 fetchLatest();
-setInterval(fetchLatest, POLL_MS);
 
 setInterval(() => {
   if (document.getElementById('clearState').style.display !== 'none') {

@@ -36,7 +36,7 @@
       font-family: "Lexend Deca", system-ui, sans-serif;
     }
     a { color: inherit; }
-    .page { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 56px; }
+    .page { width: min(1460px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 56px; }
     .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:24px; }
     .brand { display:flex; align-items:center; gap:14px; min-width:0; }
     .radar-mark {
@@ -115,7 +115,7 @@
     </div>
     <nav class="nav" aria-label="Flight tracker navigation">
       <a href="/">Live radar</a>
-      <a href="/screen.html">Screen</a>
+      <a href="/screen.html">Display view</a>
       <a href="/dashboard">Analytics</a>
       <a class="primary" href="/admin">Admin</a>
     </nav>
@@ -140,6 +140,11 @@
             <div>
               <label for="radius">Search radius (km)</label>
               <input id="radius" name="radius_km" type="number" min="0.1" max="100" step="0.1" required>
+            </div>
+            <div>
+              <label for="pollInterval">OpenSky polling interval (seconds)</label>
+              <input id="pollInterval" name="poll_interval_seconds" type="number" min="5" max="3600" step="1" required>
+              <div class="settings-note">15 seconds = up to 5,760 fresh calls/day. 23 seconds = about 3,757/day.</div>
             </div>
 
             <div class="settings-section">
@@ -185,8 +190,7 @@
       <section class="panel card logs-panel">
         <div class="eyebrow">Diagnostics</div>
         <h2>Application logs</h2>
-        <p class="hint">The useful bits of Portainer, without having to visit Portainer.</p>
-        <div class="log-toolbar">
+                <div class="log-toolbar">
           <button id="refreshLogs" class="secondary" type="button">Refresh</button>
           <label><input id="autoRefreshLogs" type="checkbox" checked> Auto-refresh</label>
           <label><input id="followLogs" type="checkbox" checked> Follow latest</label>
@@ -210,6 +214,7 @@ const settingsForm = document.getElementById('settingsForm');
 const latitudeInput = document.getElementById('latitude');
 const longitudeInput = document.getElementById('longitude');
 const radiusInput = document.getElementById('radius');
+const pollIntervalInput = document.getElementById('pollInterval');
 const settingsStatus = document.getElementById('settingsStatus');
 const saveSettingsButton = document.getElementById('saveSettingsButton');
 const primaryClientIdInput = document.getElementById('primaryClientId');
@@ -236,6 +241,7 @@ async function loadSettings(){
     latitudeInput.value=settings.lat;
     longitudeInput.value=settings.lon;
     radiusInput.value=settings.radius_km;
+    pollIntervalInput.value=settings.poll_interval_seconds||15;
     const openSky=settings.openSky||{};
     const primary=openSky.primary||{};
     const backup=openSky.backup||{};
@@ -261,6 +267,7 @@ settingsForm.addEventListener('submit',async e=>{
       lat:Number(latitudeInput.value),
       lon:Number(longitudeInput.value),
       radius_km:Number(radiusInput.value),
+      poll_interval_seconds:Number(pollIntervalInput.value),
       openSky:{
         primary:{clientId:primaryClientIdInput.value.trim(),clientSecret:primaryClientSecretInput.value},
         backup:{clientId:backupClientIdInput.value.trim(),clientSecret:backupClientSecretInput.value}
@@ -276,6 +283,7 @@ settingsForm.addEventListener('submit',async e=>{
     latitudeInput.value=data.settings.lat;
     longitudeInput.value=data.settings.lon;
     radiusInput.value=data.settings.radius_km;
+    pollIntervalInput.value=data.settings.poll_interval_seconds||15;
     primaryClientSecretInput.value='';
     backupClientSecretInput.value='';
     const primary=data.settings.openSky?.primary||{};

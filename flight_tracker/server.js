@@ -21,9 +21,11 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
-  lat: -33.90617646981154,
-  lon: 151.1702608737488,
+  // Public, non-personal default: Sydney Opera House.
+  lat: -33.8568,
+  lon: 151.2153,
   radius_km: 1.5,
+  poll_interval_seconds: 15,
   openSky: {
     primary: { clientId: '', clientSecret: '' },
     backup: { clientId: '', clientSecret: '' }
@@ -42,6 +44,7 @@ function normaliseSettings(raw) {
     lat: Number(source.lat ?? DEFAULT_SETTINGS.lat),
     lon: Number(source.lon ?? DEFAULT_SETTINGS.lon),
     radius_km: Number(source.radius_km ?? DEFAULT_SETTINGS.radius_km),
+    poll_interval_seconds: Number(source.poll_interval_seconds ?? DEFAULT_SETTINGS.poll_interval_seconds),
     openSky: {
       primary: {
         clientId: String(primary.clientId || ''),
@@ -64,6 +67,9 @@ function validateSettings(settings) {
   }
   if (!Number.isFinite(settings.radius_km) || settings.radius_km <= 0 || settings.radius_km > 100) {
     throw new Error('Radius must be greater than 0 and no more than 100 km');
+  }
+  if (!Number.isFinite(settings.poll_interval_seconds) || settings.poll_interval_seconds < 5 || settings.poll_interval_seconds > 3600) {
+    throw new Error('Polling interval must be between 5 and 3600 seconds');
   }
 }
 
@@ -94,6 +100,7 @@ function publicSettings() {
     lat: appSettings.lat,
     lon: appSettings.lon,
     radius_km: appSettings.radius_km,
+    poll_interval_seconds: appSettings.poll_interval_seconds,
     openSky: {
       primary: {
         clientId: appSettings.openSky.primary.clientId,
@@ -1277,7 +1284,10 @@ function haversineKm(
   return R * c;
 }
 
-const OPENSKY_CACHE_MS = 15 * 1000;
+function openSkyCacheMs() {
+  return Math.max(5, Number(appSettings.poll_interval_seconds) || 15) * 1000;
+}
+
 const OPENSKY_MIN_BACKOFF_MS = 60 * 1000;
 
 let openSkyCache = {
@@ -1398,7 +1408,7 @@ async function getOpenSkyStates(box) {
 
   if (
     openSkyCache.key === key &&
-    now - openSkyCache.timestamp < OPENSKY_CACHE_MS
+    now - openSkyCache.timestamp < openSkyCacheMs()
   ) {
     return openSkyCache.states;
   }
@@ -1834,6 +1844,7 @@ const server =
               lat: incoming.lat,
               lon: incoming.lon,
               radius_km: incoming.radius_km,
+              poll_interval_seconds: incoming.poll_interval_seconds,
               openSky: {
                 primary: {
                   clientId: String(openSkyIncoming.primary?.clientId || ''),
@@ -1849,7 +1860,7 @@ const server =
             saveAppSettings(next);
             refreshCredentialSets();
 
-            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius)`);
+            console.log(`[Settings] Updated tracker location to ${appSettings.lat}, ${appSettings.lon} (${appSettings.radius_km} km radius), OpenSky polling every ${appSettings.poll_interval_seconds}s`);
 
             res.writeHead(200, {
               'content-type': 'application/json',
@@ -2468,6 +2479,14 @@ const server =
               },
               radius_km:
                 appSettings.radius_km,
+              poll_interval_seconds:
+                appSettings.poll_interval_seconds,
+              server_time: {
+                epoch_ms: Date.now(),
+                minutes_since_midnight:
+                  new Date().getHours() * 60 +
+                  new Date().getMinutes()
+              },
               count:
                 result.length,
               aircraft:

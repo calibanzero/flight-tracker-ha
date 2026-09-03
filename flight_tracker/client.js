@@ -1,5 +1,7 @@
 let map, markers = {};
 let lastCentreKey = null;
+let pollTimer = null;
+let pollMs = 15000;
 
 const SYD_AIRPORT = {
   iata: 'SYD',
@@ -10,7 +12,8 @@ const SYD_AIRPORT = {
 
 document.addEventListener('DOMContentLoaded', () => {
   // Initialize map
-  map = L.map('map').setView([-33.90617646981154, 151.1702608737488], 13);
+  // Start somewhere public before the saved tracking location arrives.
+  map = L.map('map').setView([-33.8568, 151.2153], 13);
 
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors'
@@ -42,6 +45,10 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const res = await fetch('/api/traffic');
       const json = await res.json();
+      const configuredPoll = Number(json.poll_interval_seconds);
+      if (Number.isFinite(configuredPoll)) {
+        pollMs = Math.max(5000, configuredPoll * 1000);
+      }
       const t1 = performance.now();
 
       // Keep the map centred on the tracking location from Admin.
@@ -142,9 +149,11 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       console.error(err);
       status.textContent = `Error fetching data: ${err.message}`;
+    } finally {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(fetchData, pollMs);
     }
   }
 
   fetchData();
-  setInterval(fetchData, 15000);
 });
