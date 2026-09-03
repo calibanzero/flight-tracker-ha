@@ -3,6 +3,7 @@ const POLL_MS = 15000;
 
 let currentFlight = null;
 let currentBgCode = null;
+let clearSkyMode = null;
 
 function toMs(value) {
   const n = Number(value);
@@ -25,7 +26,9 @@ function airportParts(ap) {
     };
   }
   const code = String(ap.iata || ap.icao || ap.code || 'UNK').toUpperCase();
-  const location = toTitleCase([ap.city, ap.country].filter(Boolean).join(', '));
+  const location = toTitleCase(
+    [ap.city || ap.municipality, ap.country].filter(Boolean).join(', ') || ap.name || ''
+  );
   return { code, location };
 }
 
@@ -72,6 +75,28 @@ function renderAirline(el, flight) {
   el.appendChild(span);
 }
 
+function serverHour() {
+  const hour = new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney',
+    hour: '2-digit',
+    hour12: false
+  }).format(new Date());
+  return Number.parseInt(hour, 10);
+}
+
+function setClearSkyBackground() {
+  const overlay = document.getElementById('bg-overlay');
+  const hour = serverHour();
+  const mode = hour >= 7 && hour < 19 ? 'day' : 'night';
+
+  currentBgCode = null;
+  overlay.style.backgroundImage = '';
+  overlay.style.opacity = '1';
+  overlay.classList.remove('clear-day', 'clear-night');
+  overlay.classList.add(mode === 'day' ? 'clear-day' : 'clear-night');
+  clearSkyMode = mode;
+}
+
 function setBackground(flight, dimmed = false) {
   const o = airportParts(flight?.origin);
   const d = airportParts(flight?.destination);
@@ -80,6 +105,8 @@ function setBackground(flight, dimmed = false) {
   else if (d.code && d.code !== 'UNK' && d.code !== 'SYD') code = d.code;
 
   const overlay = document.getElementById('bg-overlay');
+  overlay.classList.remove('clear-day', 'clear-night');
+  clearSkyMode = null;
   overlay.style.opacity = dimmed ? '.28' : '.48';
   if (code === currentBgCode) return;
   currentBgCode = code;
@@ -116,7 +143,7 @@ function renderClear(flight) {
     document.getElementById('lastMeta').textContent = '';
     document.getElementById('lastTime').textContent = '';
     document.getElementById('lastLogo').innerHTML = '';
-    setBackground(null, true);
+    setClearSkyBackground();
     return;
   }
 
@@ -126,7 +153,7 @@ function renderClear(flight) {
   document.getElementById('lastTime').textContent = displayTime(last.firstSeen);
   const logo = airlineLogo(last);
   document.getElementById('lastLogo').innerHTML = logo ? `<img src="${logo}" alt="">` : '';
-  setBackground(last, true);
+  setClearSkyBackground();
 }
 
 function applyState(flight) {
@@ -160,3 +187,10 @@ async function fetchLatest() {
 document.getElementById('homeHotspot').addEventListener('click', () => { window.location.href = '/'; });
 fetchLatest();
 setInterval(fetchLatest, POLL_MS);
+
+setInterval(() => {
+  if (document.getElementById('clearState').style.display !== 'none') {
+    const nextMode = serverHour() >= 7 && serverHour() < 19 ? 'day' : 'night';
+    if (nextMode !== clearSkyMode) setClearSkyBackground();
+  }
+}, 60000);

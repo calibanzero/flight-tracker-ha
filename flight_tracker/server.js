@@ -1200,11 +1200,15 @@ async function lookupAdsbdb(icao24, callsign) {
 
 function formatAdsbAirport(airport) {
   if (!airport) return 'Unknown';
+
   const code = airport.iata || airport.icao || '';
-  const details = airport.name || [airport.municipality, airport.country].filter(Boolean).join(', ');
-  if (!code && !details) return 'Unknown';
+  const location = [airport.municipality, airport.country]
+    .filter(Boolean)
+    .join(', ');
+  const details = location || airport.name || 'Unknown location';
+
   if (!code) return details;
-  return `${code} - ${details || 'Unknown location'}`;
+  return `${code}<br>${details}`;
 }
 
 // -----------------------------

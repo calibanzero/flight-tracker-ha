@@ -1,4 +1,5 @@
 let map, markers = {};
+let lastCentreKey = null;
 
 const SYD_AIRPORT = {
   iata: 'SYD',
@@ -18,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const table = document.getElementById('aircraftTable');
   const status = document.getElementById('status');
   const debugBlock = document.getElementById('debug');
+  const trackingSummary = document.getElementById('trackingSummary');
 
   function formatAirport(ap) {
     if (!ap) return 'Unknown';
@@ -42,6 +44,23 @@ document.addEventListener('DOMContentLoaded', () => {
       const json = await res.json();
       const t1 = performance.now();
 
+      // Keep the map centred on the tracking location from Admin.
+      const centreLat = Number(json.centre?.lat);
+      const centreLon = Number(json.centre?.lon);
+      const radiusKm = Number(json.radius_km);
+
+      if (Number.isFinite(centreLat) && Number.isFinite(centreLon)) {
+        const centreKey = `${centreLat}:${centreLon}:${Number.isFinite(radiusKm) ? radiusKm : ''}`;
+        if (centreKey !== lastCentreKey) {
+          map.setView([centreLat, centreLon], map.getZoom());
+          lastCentreKey = centreKey;
+        }
+      }
+
+      if (trackingSummary && Number.isFinite(radiusKm)) {
+        trackingSummary.textContent = `Aircraft passing through the ${radiusKm} km tracking area`;
+      }
+
       // Update status
       status.textContent = `Last updated: ${new Date().toLocaleTimeString()} • ${json.count} aircraft • ${Math.round(t1 - t0)} ms`;
 
@@ -52,10 +71,13 @@ document.addEventListener('DOMContentLoaded', () => {
         debugBlock.textContent = '';
       }
 
-      // Update table
+      // Update table, newest aircraft first.
       const tbody = table.querySelector('tbody');
       tbody.innerHTML = '';
-      json.aircraft.forEach(ac => {
+      const recentAircraft = [...json.aircraft].sort(
+        (a, b) => Number(b.firstSeen || 0) - Number(a.firstSeen || 0)
+      );
+      recentAircraft.forEach(ac => {
         // SYD fallback: if destination unknown and origin is not SYD, set destination to SYD
         const originCode = ac.origin?.iata || ac.origin?.code || '';
         const destName = ac.destination?.name || '';
