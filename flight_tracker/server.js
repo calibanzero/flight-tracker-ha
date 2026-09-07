@@ -942,6 +942,195 @@ function normaliseCallsign(value) {
   return String(value || '').replace(/\s+/g, '').trim().toUpperCase();
 }
 
+// -----------------------------
+// Personal-only FlightAware HTML fallback
+// -----------------------------
+// FlightAware's website terms prohibit automated scraping. This fallback is
+// intentionally isolated from the public/HAOS build and should be treated as
+// a local experiment. Disable instantly with FLIGHTAWARE_SCRAPE_ENABLED=false.
+const FLIGHTAWARE_SCRAPE_ENABLED =
+  String(process.env.FLIGHTAWARE_SCRAPE_ENABLED || 'true').toLowerCase() !== 'false';
+const FLIGHTAWARE_SCRAPE_CACHE_MS = 6 * 60 * 60 * 1000;
+const FLIGHTAWARE_SCRAPE_NEGATIVE_CACHE_MS = 30 * 60 * 1000;
+const flightAwareScrapeCache = new Map();
+const flightAwareScrapeNegativeCache = new Map();
+const FLIGHTAWARE_HTTPS_AGENT = new https.Agent({ family: 4, keepAlive: true });
+
+function decodeHtml(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function stripHtml(value) {
+  return decodeHtml(String(value || '').replace(/<[^>]*>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function airportFromFlightAwareLink(hrefCode, text) {
+  const cleanText = stripHtml(text);
+  const pair = cleanText.match(/\(([A-Z0-9]{3})\s*\/\s*([A-Z0-9]{4})\)/i);
+  const singleIata = cleanText.match(/\b([A-Z]{3})\b(?!.*\b[A-Z]{3}\b)/i);
+  const code = String(hrefCode || '').toUpperCase();
+
+  let iata = pair ? pair[1].toUpperCase() : null;
+  let icao = pair ? pair[2].toUpperCase() : null;
+
+  if (!icao && /^[A-Z0-9]{4}$/.test(code)) icao = code;
+  if (!iata && /^[A-Z]{3}$/.test(code)) iata = code;
+  if (!iata && singleIata && !/^[A-Z0-9]{4}$/.test(singleIata[1])) {
+    iata = singleIata[1].toUpperCase();
+  }
+
+  const name = cleanText
+    .replace(/\s*\([A-Z0-9]{3}\s*\/\s*[A-Z0-9]{4}\)\s*$/i, '')
+    .trim() || null;
+
+  return { iata, icao, name, municipality: null, country: null };
+}
+
+function extractAirportLinks(fragment) {
+  const links = [];
+  const re = /<a\b[^>]*href=["']\/live\/airport\/([A-Z0-9]{3,4})[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = re.exec(fragment)) !== null) {
+    links.push(airportFromFlightAwareLink(match[1], match[2]));
+  }
+  return links;
+}
+
+function parseFleetRow(html, callsign) {
+  const escaped = callsign.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rowRe = new RegExp(`<tr\\b[^>]*>[\\s\\S]*?\\b${escaped}\\b[\\s\\S]*?<\\/tr>`, 'i');
+  const rowMatch = html.match(rowRe);
+  if (!rowMatch) return null;
+
+  const airports = extractAirportLinks(rowMatch[0]);
+  if (airports.length < 2) return null;
+
+  return {
+    origin: airports[0],
+    destination: airports[1],
+    source: 'flightaware-fleet-scrape'
+  };
+}
+
+function htmlWindowAfterClass(html, className, size = 6000) {
+  const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`class=["'][^"']*\\b${escaped}\\b[^"']*["']`, 'i');
+  const match = re.exec(html);
+  if (!match) return null;
+  return html.slice(match.index, match.index + size);
+}
+
+function parseIndividualFlightPage(html) {
+  // FlightAware's summary blocks contain nested elements, so use a bounded
+  // window from the class marker rather than trying to parse nested HTML with
+  // a single closing-tag regex.
+  const originBlock = htmlWindowAfterClass(html, 'flightPageSummaryOrigin');
+  const destinationBlock = htmlWindowAfterClass(html, 'flightPageSummaryDestination');
+  if (!originBlock || !destinationBlock) return null;
+
+  const originLinks = extractAirportLinks(originBlock);
+  const destinationLinks = extractAirportLinks(destinationBlock);
+  if (!originLinks.length || !destinationLinks.length) return null;
+
+  return {
+    origin: originLinks[0],
+    destination: destinationLinks[0],
+    source: 'flightaware-flight-scrape'
+  };
+}
+
+async function fetchFlightAwareHtml(url, label) {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-AU,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+      },
+      agent: FLIGHTAWARE_HTTPS_AGENT,
+      redirect: 'follow',
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      console.warn(`[FlightAwareFallback] ${label} returned HTTP ${res.status}`);
+      return null;
+    }
+
+    const html = await res.text();
+    return html && html.length > 500 ? html : null;
+  } catch (err) {
+    console.warn(`[FlightAwareFallback] ${label} failed: ${err?.message || err}`);
+    return null;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+async function lookupFlightAwareScrape(callsign) {
+  if (!FLIGHTAWARE_SCRAPE_ENABLED) return null;
+
+  const cleanCallsign = normaliseCallsign(callsign);
+  if (!cleanCallsign || cleanCallsign.length < 3) return null;
+
+  const now = Date.now();
+  const cached = flightAwareScrapeCache.get(cleanCallsign);
+  if (cached && now - cached.timestamp < FLIGHTAWARE_SCRAPE_CACHE_MS) {
+    return cached.data;
+  }
+
+  const failedAt = flightAwareScrapeNegativeCache.get(cleanCallsign);
+  if (failedAt && now - failedAt < FLIGHTAWARE_SCRAPE_NEGATIVE_CACHE_MS) {
+    return null;
+  }
+
+  let result = null;
+  const operatorPrefix = cleanCallsign.match(/^([A-Z]{3})/i)?.[1];
+
+  // Airline operational callsigns such as QLK226D and QTR40X are often listed
+  // directly on FlightAware's live fleet page even when the public flight number
+  // is different. This is the cheapest useful lookup, so try it first.
+  if (operatorPrefix) {
+    const fleetUrl = `https://www.flightaware.com/live/fleet/${encodeURIComponent(operatorPrefix)}`;
+    const fleetHtml = await fetchFlightAwareHtml(fleetUrl, `fleet ${operatorPrefix}`);
+    if (fleetHtml) result = parseFleetRow(fleetHtml, cleanCallsign);
+  }
+
+  // Registration-style callsigns (e.g. VHLAW), or callsigns absent from the
+  // current fleet table, get one individual-page attempt.
+  if (!result) {
+    const flightUrl = `https://www.flightaware.com/live/flight/${encodeURIComponent(cleanCallsign)}`;
+    const flightHtml = await fetchFlightAwareHtml(flightUrl, `flight ${cleanCallsign}`);
+    if (flightHtml) result = parseIndividualFlightPage(flightHtml);
+  }
+
+  if (result?.origin && result?.destination) {
+    flightAwareScrapeCache.set(cleanCallsign, { timestamp: now, data: result });
+    flightAwareScrapeNegativeCache.delete(cleanCallsign);
+    console.log(
+      `[FlightAwareFallback] Resolved ${cleanCallsign}: ` +
+      `${result.origin.iata || result.origin.icao || '?'} -> ` +
+      `${result.destination.iata || result.destination.icao || '?'} (${result.source})`
+    );
+    return result;
+  }
+
+  flightAwareScrapeNegativeCache.set(cleanCallsign, now);
+  console.log(`[FlightAwareFallback] No route found for ${cleanCallsign}; caching miss for 30 minutes`);
+  return null;
+}
+
 async function fetchAdsbdbJson(url, label) {
   const controller = new AbortController();
   const timeoutHandle = setTimeout(
@@ -2246,6 +2435,23 @@ const server =
                         name: adsbData.airline.name,
                         logo: airlineMap[adsbData.airline.icao]?.logo || null
                       };
+                    }
+                  }
+                }
+
+                // Personal-only fallback for operational callsigns that ADSBDB
+                // cannot map to a route (e.g. QLK226D / QTR40X).
+                if (
+                  flightNo &&
+                  (origin === 'Unknown' || destination === 'Unknown')
+                ) {
+                  const scrapedRoute = await lookupFlightAwareScrape(flightNo);
+                  if (scrapedRoute) {
+                    if (origin === 'Unknown') {
+                      origin = formatAdsbAirport(scrapedRoute.origin);
+                    }
+                    if (destination === 'Unknown') {
+                      destination = formatAdsbAirport(scrapedRoute.destination);
                     }
                   }
                 }
