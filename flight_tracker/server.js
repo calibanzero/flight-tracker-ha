@@ -1051,10 +1051,160 @@ function htmlWindowAfterClass(html, className, size = 6000) {
   return html.slice(match.index, match.index + size);
 }
 
-function parseIndividualFlightPage(html) {
-  // FlightAware's summary blocks contain nested elements, so use a bounded
-  // window from the class marker rather than trying to parse nested HTML with
-  // a single closing-tag regex.
+function extractBalancedObjectAfter(html, marker) {
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex < 0) return null;
+
+  const start = html.indexOf('{', markerIndex + marker.length);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < html.length; i += 1) {
+    const ch = html[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return html.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function airportFromFlightAwareObject(airport) {
+  if (!airport || typeof airport !== 'object') return null;
+
+  const iata = String(
+    airport.iata || airport.iataCode || airport.iata_code || ''
+  ).trim().toUpperCase() || null;
+
+  const icao = String(
+    airport.icao || airport.icaoCode || airport.icao_code || airport.ident || ''
+  ).trim().toUpperCase() || null;
+
+  const name = String(
+    airport.friendlyName || airport.name || airport.airportName || ''
+  ).trim() || null;
+
+  // FlightAware commonly supplies a ready-to-display friendlyLocation such as
+  // "Dubbo, New South Wales, Australia". Prefer that over trying to rebuild it
+  // from fields whose names have changed over time.
+  const friendlyLocation = String(
+    airport.friendlyLocation || airport.location || ''
+  ).trim() || null;
+
+  const city = String(
+    airport.city || airport.municipality || ''
+  ).trim() || null;
+
+  const country = friendlyLocation
+    ? null
+    : String(
+        airport.country || airport.countryName || airport.country_name || ''
+      ).trim() || null;
+
+  if (!iata && !icao && !name && !friendlyLocation && !city) return null;
+
+  return {
+    iata,
+    icao,
+    name,
+    municipality: friendlyLocation || city,
+    country
+  };
+}
+
+function parseTrackpollBootstrap(html, callsign) {
+  const markers = [
+    'var trackpollBootstrap =',
+    'trackpollBootstrap ='
+  ];
+
+  let raw = null;
+  for (const marker of markers) {
+    raw = extractBalancedObjectAfter(html, marker);
+    if (raw) break;
+  }
+
+  if (!raw) {
+    return { result: null, reason: 'trackpollBootstrap not present' };
+  }
+
+  let bootstrap;
+  try {
+    bootstrap = JSON.parse(raw);
+  } catch (err) {
+    return {
+      result: null,
+      reason: `trackpollBootstrap JSON parse failed: ${err.message}`
+    };
+  }
+
+  const flights = Object.values(bootstrap?.flights || {});
+  if (!flights.length) {
+    return { result: null, reason: 'trackpollBootstrap contained no flights' };
+  }
+
+  const wanted = normaliseCallsign(callsign);
+  const flight = flights.find(f => {
+    const identifiers = [
+      f?.ident,
+      f?.iataIdent,
+      f?.friendlyIdent,
+      f?.displayIdent,
+      f?.callsign
+    ]
+      .map(normaliseCallsign)
+      .filter(Boolean);
+
+    return wanted && identifiers.includes(wanted);
+  }) || flights.find(f => f?.origin && f?.destination) || flights[0];
+
+  const origin = airportFromFlightAwareObject(flight?.origin);
+  const destination = airportFromFlightAwareObject(flight?.destination);
+
+  if (!origin || !destination) {
+    return {
+      result: null,
+      reason: 'trackpollBootstrap flight had no usable origin/destination'
+    };
+  }
+
+  return {
+    result: {
+      origin,
+      destination,
+      source: 'flightaware-trackpoll-bootstrap'
+    },
+    reason: null
+  };
+}
+
+function parseLegacyIndividualFlightPage(html) {
+  // Kept as a fallback in case FlightAware serves an older page variant.
   const originBlock = htmlWindowAfterClass(html, 'flightPageSummaryOrigin');
   const destinationBlock = htmlWindowAfterClass(html, 'flightPageSummaryDestination');
   if (!originBlock || !destinationBlock) return null;
@@ -1066,8 +1216,20 @@ function parseIndividualFlightPage(html) {
   return {
     origin: originLinks[0],
     destination: destinationLinks[0],
-    source: 'flightaware-flight-scrape'
+    source: 'flightaware-legacy-summary'
   };
+}
+
+function parseIndividualFlightPage(html, callsign) {
+  const bootstrap = parseTrackpollBootstrap(html, callsign);
+  if (bootstrap.result) return bootstrap;
+
+  const legacy = parseLegacyIndividualFlightPage(html);
+  if (legacy) {
+    return { result: legacy, reason: null };
+  }
+
+  return bootstrap;
 }
 
 async function fetchFlightAwareHtml(url, label) {
@@ -1119,23 +1281,33 @@ async function lookupFlightAwareScrape(callsign) {
   }
 
   let result = null;
-  const operatorPrefix = cleanCallsign.match(/^([A-Z]{3})/i)?.[1];
+  let parseReason = null;
 
-  // Airline operational callsigns such as QLK226D and QTR40X are often listed
-  // directly on FlightAware's live fleet page even when the public flight number
-  // is different. This is the cheapest useful lookup, so try it first.
-  if (operatorPrefix) {
-    const fleetUrl = `https://www.flightaware.com/live/fleet/${encodeURIComponent(operatorPrefix)}`;
-    const fleetHtml = await fetchFlightAwareHtml(fleetUrl, `fleet ${operatorPrefix}`);
-    if (fleetHtml) result = parseFleetRow(fleetHtml, cleanCallsign);
+  // We already have the exact ATC callsign from OpenSky, and FlightAware exposes
+  // pages for operational callsigns such as QLK27D and Australian AM ambulance
+  // flights. Try that exact flight page first and parse its embedded bootstrap.
+  const flightUrl = `https://www.flightaware.com/live/flight/${encodeURIComponent(cleanCallsign)}`;
+  const flightHtml = await fetchFlightAwareHtml(flightUrl, `flight ${cleanCallsign}`);
+
+  if (flightHtml) {
+    const parsed = parseIndividualFlightPage(flightHtml, cleanCallsign);
+    result = parsed.result;
+    parseReason = parsed.reason;
+
+    if (!result && parseReason) {
+      console.log(`[FlightAwareFallback] ${cleanCallsign}: ${parseReason}`);
+    }
   }
 
-  // Registration-style callsigns (e.g. VHLAW), or callsigns absent from the
-  // current fleet table, get one individual-page attempt.
+  // Keep the old fleet-row approach as a final fallback for any page variant
+  // where the individual flight bootstrap is unavailable.
   if (!result) {
-    const flightUrl = `https://www.flightaware.com/live/flight/${encodeURIComponent(cleanCallsign)}`;
-    const flightHtml = await fetchFlightAwareHtml(flightUrl, `flight ${cleanCallsign}`);
-    if (flightHtml) result = parseIndividualFlightPage(flightHtml);
+    const operatorPrefix = cleanCallsign.match(/^([A-Z]{3})/i)?.[1];
+    if (operatorPrefix) {
+      const fleetUrl = `https://www.flightaware.com/live/fleet/${encodeURIComponent(operatorPrefix)}`;
+      const fleetHtml = await fetchFlightAwareHtml(fleetUrl, `fleet ${operatorPrefix}`);
+      if (fleetHtml) result = parseFleetRow(fleetHtml, cleanCallsign);
+    }
   }
 
   if (result?.origin && result?.destination) {
@@ -2476,11 +2648,13 @@ const server =
                   }
                 }
 
-                // Personal-only fallback for operational callsigns that ADSBDB
-                // cannot map to a route (e.g. QLK226D / QTR40X).
+                // Personal-only fallback for any callsign whose route ADSBDB
+                // cannot safely resolve. This deliberately includes Australian
+                // AM ambulance callsigns: ADSBDB route lookup is skipped for those
+                // because AM235 can collide with Aeromexico, but FlightAware's
+                // exact /live/flight/AM235 page can still provide the real route.
                 if (
                   flightNo &&
-                  !specialTask &&
                   (origin === 'Unknown' || destination === 'Unknown')
                 ) {
                   const scrapedRoute = await lookupFlightAwareScrape(flightNo);
@@ -2495,11 +2669,28 @@ const server =
                 }
 
                 if (prev) {
-                  origin = prev.data.origin || origin;
-                  destination = prev.data.destination || destination;
-                  registration = prev.data.registration || registration;
-                  type = prev.data.type || type;
-                  airline = prev.data.airline || airline;
+                  // Never let a previous literal "Unknown" erase a newly resolved
+                  // route. Re-use previous route values only when the current pass
+                  // is still unknown and the previous pass actually knew the value.
+                  if (
+                    origin === 'Unknown' &&
+                    prev.data.origin &&
+                    prev.data.origin !== 'Unknown'
+                  ) {
+                    origin = prev.data.origin;
+                  }
+
+                  if (
+                    destination === 'Unknown' &&
+                    prev.data.destination &&
+                    prev.data.destination !== 'Unknown'
+                  ) {
+                    destination = prev.data.destination;
+                  }
+
+                  registration = registration || prev.data.registration;
+                  type = type || prev.data.type;
+                  airline = airline || prev.data.airline;
                 }
 
                 // A previous cached aircraft state must never override the
