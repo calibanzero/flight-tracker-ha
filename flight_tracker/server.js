@@ -942,6 +942,29 @@ function normaliseCallsign(value) {
   return String(value || '').replace(/\s+/g, '').trim().toUpperCase();
 }
 
+// Australian special-task flight-plan callsigns can collide with commercial
+// IATA flight numbers. In particular, Airservices Australia reserves AM + a
+// numerical suffix for Ambulance operations, while AM is also Aeromexico's
+// public IATA code. Only apply this interpretation when the configured tracker
+// location is in Australia so overseas installs still resolve AM235 normally.
+function getAustralianSpecialTaskCallsign(value) {
+  const callsign = normaliseCallsign(value);
+  const lat = Number(appSettings.lat);
+  const lon = Number(appSettings.lon);
+  const trackerInAustralia =
+    Number.isFinite(lat) && Number.isFinite(lon) &&
+    lat >= -44.5 && lat <= -9.0 &&
+    lon >= 112.0 && lon <= 154.5;
+
+  if (!trackerInAustralia) return null;
+
+  if (/^AM\d{1,4}[A-Z]?$/.test(callsign)) {
+    return { type: 'ambulance', label: 'Air Ambulance' };
+  }
+
+  return null;
+}
+
 // -----------------------------
 // Personal-only FlightAware HTML fallback
 // -----------------------------
@@ -1203,7 +1226,8 @@ async function lookupAdsbdb(icao24, callsign) {
     return null;
   }
 
-  const cacheKey = `${modeS}:${cleanCallsign}`;
+  const specialTask = getAustralianSpecialTaskCallsign(cleanCallsign);
+  const cacheKey = `${modeS}:${cleanCallsign}:${specialTask ? specialTask.type : 'normal'}`;
   const now = Date.now();
 
   const cached = adsbdbCache.get(cacheKey);
@@ -1236,11 +1260,20 @@ async function lookupAdsbdb(icao24, callsign) {
       `aircraft ${modeS}`
     );
 
-  const routeResult =
-    await fetchAdsbdbJson(
-      routeUrl,
-      `callsign ${cleanCallsign}`
+  let routeResult = { status: 0, data: null };
+
+  if (specialTask) {
+    console.log(
+      `[SpecialTask] ${cleanCallsign} recognised as Australian ${specialTask.label}; ` +
+      'skipping ADSBDB route/airline lookup'
     );
+  } else {
+    routeResult =
+      await fetchAdsbdbJson(
+        routeUrl,
+        `callsign ${cleanCallsign}`
+      );
+  }
 
   if (aircraftResult.status === 404) {
     console.warn(
@@ -2392,7 +2425,11 @@ const server =
                   aircraftDb[icao24] ||
                   {};
 
-                let airline = null;
+                const specialTask = getAustralianSpecialTaskCallsign(flightNo);
+
+                let airline = specialTask
+                  ? { name: specialTask.label, logo: null }
+                  : null;
                 let origin = 'Unknown';
                 let destination = 'Unknown';
 
@@ -2443,6 +2480,7 @@ const server =
                 // cannot map to a route (e.g. QLK226D / QTR40X).
                 if (
                   flightNo &&
+                  !specialTask &&
                   (origin === 'Unknown' || destination === 'Unknown')
                 ) {
                   const scrapedRoute = await lookupFlightAwareScrape(flightNo);
@@ -2462,6 +2500,12 @@ const server =
                   registration = prev.data.registration || registration;
                   type = prev.data.type || type;
                   airline = prev.data.airline || airline;
+                }
+
+                // A previous cached aircraft state must never override the
+                // special-task label with a commercial airline match.
+                if (specialTask) {
+                  airline = { name: specialTask.label, logo: null };
                 }
 
                 if (!airline && callsign.length >= 3) {
