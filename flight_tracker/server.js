@@ -145,8 +145,8 @@ function publicSettings() {
 }
 
 loadAppSettings();
-// const KEEP_ALIVE_MS = 120 * 60 * 1000; // 120 minutes
-const KEEP_ALIVE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const KEEP_ALIVE_MS = 3 * 60 * 60 * 1000; // 3 hours
+const NEW_FLIGHT_GAP_MS = 30 * 60 * 1000; // same aircraft returning after 30 min = new flight occurrence
 
 // -----------------------------
 // Application log buffer for admin page
@@ -2593,6 +2593,38 @@ const server =
                     ? callsign.replace(/\s+/g, '')
                     : null;
 
+                // lastSeenMap is keyed by aircraft ICAO24, but an aircraft can
+                // operate several different flights within the retention window.
+                // Treat a changed callsign, or the same aircraft returning after
+                // a meaningful absence, as a new flight occurrence.
+                const currentFlightKey = normaliseCallsign(flightNo || callsign);
+                const previousFlightKey = normaliseCallsign(
+                  prev?.data?.flightNo || prev?.data?.callsign || ''
+                );
+                const callsignChanged = Boolean(
+                  prev &&
+                  currentFlightKey &&
+                  previousFlightKey &&
+                  currentFlightKey !== previousFlightKey
+                );
+                const returnedAfterGap = Boolean(
+                  prev &&
+                  now - prev.timestamp >= NEW_FLIGHT_GAP_MS
+                );
+                const isNewFlightOccurrence = Boolean(
+                  !prev || callsignChanged || returnedAfterGap
+                );
+                const reusablePrev = isNewFlightOccurrence ? null : prev;
+
+                if (prev && isNewFlightOccurrence) {
+                  const reason = callsignChanged
+                    ? `${previousFlightKey || 'unknown'} -> ${currentFlightKey || 'unknown'}`
+                    : `${Math.round((now - prev.timestamp) / 60000)} min gap`;
+                  console.log(
+                    `[FlightTrack] New flight occurrence for ${icao24.toUpperCase()}: ${reason}`
+                  );
+                }
+
                 const acMeta =
                   aircraftDb[icao24] ||
                   {};
@@ -2617,7 +2649,7 @@ const server =
                     localMeta: acMeta
                   });
 
-                if (flightNo && (!prev || prev.data.origin === 'Unknown' || prev.data.destination === 'Unknown')) {
+                if (flightNo && (!reusablePrev || reusablePrev.data.origin === 'Unknown' || reusablePrev.data.destination === 'Unknown')) {
                   const adsbData = await lookupAdsbdb(icao24, flightNo);
 
                   if (adsbData) {
@@ -2668,29 +2700,29 @@ const server =
                   }
                 }
 
-                if (prev) {
+                if (reusablePrev) {
                   // Never let a previous literal "Unknown" erase a newly resolved
                   // route. Re-use previous route values only when the current pass
                   // is still unknown and the previous pass actually knew the value.
                   if (
                     origin === 'Unknown' &&
-                    prev.data.origin &&
-                    prev.data.origin !== 'Unknown'
+                    reusablePrev.data.origin &&
+                    reusablePrev.data.origin !== 'Unknown'
                   ) {
-                    origin = prev.data.origin;
+                    origin = reusablePrev.data.origin;
                   }
 
                   if (
                     destination === 'Unknown' &&
-                    prev.data.destination &&
-                    prev.data.destination !== 'Unknown'
+                    reusablePrev.data.destination &&
+                    reusablePrev.data.destination !== 'Unknown'
                   ) {
-                    destination = prev.data.destination;
+                    destination = reusablePrev.data.destination;
                   }
 
-                  registration = registration || prev.data.registration;
-                  type = type || prev.data.type;
-                  airline = airline || prev.data.airline;
+                  registration = registration || reusablePrev.data.registration;
+                  type = type || reusablePrev.data.type;
+                  airline = airline || reusablePrev.data.airline;
                 }
 
                 // A previous cached aircraft state must never override the
@@ -2787,7 +2819,7 @@ const server =
                   origin,
                   destination,
                   firstSeen:
-                    prev?.data.firstSeen ||
+                    reusablePrev?.data.firstSeen ||
                     now
                 };
 
@@ -2801,7 +2833,7 @@ const server =
                   }
                 );
 
-                if (!prev) {
+                if (isNewFlightOccurrence) {
                   logFlightSnapshot(
                     aircraftData
                   );
