@@ -1846,6 +1846,466 @@ async function getOpenSkyStates(box) {
 const lastSeenMap =
   new Map();
 
+
+// -----------------------------
+// Background aircraft tracking
+// -----------------------------
+// Tracking must be a server responsibility, not a side effect of someone
+// having the web UI open.  Only one refresh may run at once.  /api/traffic
+// simply reads the latest in-memory snapshot produced here.
+let trackingRefreshPromise = null;
+let backgroundTrackingTimer = null;
+let backgroundTrackingStopped = false;
+
+function buildTrafficPayload(now = Date.now()) {
+  const result = [];
+
+  for (const [icao, info] of lastSeenMap.entries()) {
+    if (now - info.timestamp <= KEEP_ALIVE_MS) {
+      result.push(info.data);
+    } else {
+      lastSeenMap.delete(icao);
+    }
+  }
+
+  return {
+    centre: {
+      lat: appSettings.lat,
+      lon: appSettings.lon
+    },
+    radius_km: appSettings.radius_km,
+    poll_interval_seconds: appSettings.poll_interval_seconds,
+    display_timezone: appSettings.display_timezone,
+    server_time: {
+      epoch_ms: Date.now(),
+      timezone: appSettings.display_timezone,
+      minutes_since_midnight:
+        minutesSinceMidnightInTimeZone(appSettings.display_timezone)
+    },
+    count: result.length,
+    aircraft: result
+  };
+}
+
+async function refreshTrackingSnapshot() {
+  if (trackingRefreshPromise) {
+    return trackingRefreshPromise;
+  }
+
+  trackingRefreshPromise = (async () => {
+        const now =
+          Date.now();
+
+        const box =
+          bboxAround(
+            appSettings.lat,
+            appSettings.lon,
+            appSettings.radius_km
+          );
+
+        let states = [];
+
+        try {
+          states =
+            await getOpenSkyStates(
+              box
+            );
+        } catch (err) {
+          console.error(
+            'OpenSky fetch failed:',
+            err.message
+          );
+        }
+
+        const newAirportLines =
+          [];
+
+        const newUnknownFlights =
+          [];
+
+        await Promise.all(
+          states.map(
+            async s => {
+              if (
+                s[5] == null ||
+                s[6] == null
+              ) {
+                return;
+              }
+
+              if (
+                haversineKm(
+                  appSettings.lat,
+                  appSettings.lon,
+                  s[6],
+                  s[5]
+                ) >
+                appSettings.radius_km
+              ) {
+                return;
+              }
+
+              const icao24 =
+                s[0]
+                  ?.toLowerCase() ||
+                '';
+
+              const callsign =
+                (
+                  s[1] || ''
+                ).trim();
+
+              const lat =
+                s[6];
+
+              const lon =
+                s[5];
+
+              const prev =
+                lastSeenMap.get(
+                  icao24
+                );
+
+              const flightNo =
+                callsign.length > 2
+                  ? callsign.replace(/\s+/g, '')
+                  : null;
+
+              // lastSeenMap is keyed by aircraft ICAO24, but an aircraft can
+              // operate several different flights within the retention window.
+              // Treat a changed callsign, or the same aircraft returning after
+              // a meaningful absence, as a new flight occurrence.
+              const currentFlightKey = normaliseCallsign(flightNo || callsign);
+              const previousFlightKey = normaliseCallsign(
+                prev?.data?.flightNo || prev?.data?.callsign || ''
+              );
+              const callsignChanged = Boolean(
+                prev &&
+                currentFlightKey &&
+                previousFlightKey &&
+                currentFlightKey !== previousFlightKey
+              );
+              const returnedAfterGap = Boolean(
+                prev &&
+                now - prev.timestamp >= NEW_FLIGHT_GAP_MS
+              );
+              const isNewFlightOccurrence = Boolean(
+                !prev || callsignChanged || returnedAfterGap
+              );
+              const reusablePrev = isNewFlightOccurrence ? null : prev;
+
+              if (prev && isNewFlightOccurrence) {
+                const reason = callsignChanged
+                  ? `${previousFlightKey || 'unknown'} -> ${currentFlightKey || 'unknown'}`
+                  : `${Math.round((now - prev.timestamp) / 60000)} min gap`;
+                console.log(
+                  `[FlightTrack] New flight occurrence for ${icao24.toUpperCase()}: ${reason}`
+                );
+              }
+
+              const acMeta =
+                aircraftDb[icao24] ||
+                {};
+
+              const specialTask = getAustralianSpecialTaskCallsign(flightNo);
+
+              let airline = specialTask
+                ? { name: specialTask.label, logo: null }
+                : null;
+              let origin = 'Unknown';
+              let destination = 'Unknown';
+
+              let registration =
+                acMeta.registration ||
+                acMeta.Registration ||
+                null;
+
+              let type =
+                friendlyAircraftType({
+                  adsbType: null,
+                  adsbIcaoType: null,
+                  localMeta: acMeta
+                });
+
+              if (flightNo && (!reusablePrev || reusablePrev.data.origin === 'Unknown' || reusablePrev.data.destination === 'Unknown')) {
+                const adsbData = await lookupAdsbdb(icao24, flightNo);
+
+                if (adsbData) {
+                  registration =
+                    adsbData.registration ||
+                    registration;
+
+                  type =
+                    friendlyAircraftType({
+                      adsbType:
+                        adsbData.type,
+                      adsbIcaoType:
+                        adsbData.icaoType,
+                      localMeta:
+                        acMeta
+                    }) ||
+                    type;
+
+                  origin = formatAdsbAirport(adsbData.origin);
+                  destination = formatAdsbAirport(adsbData.destination);
+
+                  if (adsbData.airline?.name) {
+                    airline = {
+                      name: adsbData.airline.name,
+                      logo: airlineMap[adsbData.airline.icao]?.logo || null
+                    };
+                  }
+                }
+              }
+
+              // Personal-only fallback for any callsign whose route ADSBDB
+              // cannot safely resolve. This deliberately includes Australian
+              // AM ambulance callsigns: ADSBDB route lookup is skipped for those
+              // because AM235 can collide with Aeromexico, but FlightAware's
+              // exact /live/flight/AM235 page can still provide the real route.
+              if (
+                flightNo &&
+                (origin === 'Unknown' || destination === 'Unknown')
+              ) {
+                const scrapedRoute = await lookupFlightAwareScrape(flightNo);
+                if (scrapedRoute) {
+                  if (origin === 'Unknown') {
+                    origin = formatAdsbAirport(scrapedRoute.origin);
+                  }
+                  if (destination === 'Unknown') {
+                    destination = formatAdsbAirport(scrapedRoute.destination);
+                  }
+                }
+              }
+
+              if (reusablePrev) {
+                // Never let a previous literal "Unknown" erase a newly resolved
+                // route. Re-use previous route values only when the current pass
+                // is still unknown and the previous pass actually knew the value.
+                if (
+                  origin === 'Unknown' &&
+                  reusablePrev.data.origin &&
+                  reusablePrev.data.origin !== 'Unknown'
+                ) {
+                  origin = reusablePrev.data.origin;
+                }
+
+                if (
+                  destination === 'Unknown' &&
+                  reusablePrev.data.destination &&
+                  reusablePrev.data.destination !== 'Unknown'
+                ) {
+                  destination = reusablePrev.data.destination;
+                }
+
+                registration = registration || reusablePrev.data.registration;
+                type = type || reusablePrev.data.type;
+                airline = airline || reusablePrev.data.airline;
+              }
+
+              // A previous cached aircraft state must never override the
+              // special-task label with a commercial airline match.
+              if (specialTask) {
+                airline = { name: specialTask.label, logo: null };
+              }
+
+              if (!airline && callsign.length >= 3) {
+                const code = callsign.slice(0, 3).toUpperCase();
+                if (airlineMap[code]) {
+                  airline = {
+                    name: airlineMap[code].name,
+                    logo: airlineMap[code].logo
+                  };
+                }
+              }
+
+              const oa =
+                makeAirportLine(
+                  origin
+                );
+
+              if (
+                oa &&
+                oa.code &&
+                oa.code !==
+                  'UNK' &&
+                !loggedAirports.has(
+                  oa.code
+                )
+              ) {
+                loggedAirports.add(
+                  oa.code
+                );
+
+                newAirportLines.push(
+                  oa.line
+                );
+              }
+
+              const da =
+                makeAirportLine(
+                  destination
+                );
+
+              if (
+                da &&
+                da.code &&
+                da.code !==
+                  'UNK' &&
+                !loggedAirports.has(
+                  da.code
+                )
+              ) {
+                loggedAirports.add(
+                  da.code
+                );
+
+                newAirportLines.push(
+                  da.line
+                );
+              }
+
+              if (
+                !airline ||
+                !airline.name
+              ) {
+                if (
+                  flightNo &&
+                  !loggedUnknownAirlines.has(
+                    flightNo
+                  )
+                ) {
+                  loggedUnknownAirlines.add(
+                    flightNo
+                  );
+
+                  newUnknownFlights.push(
+                    flightNo
+                  );
+                }
+              }
+
+              const aircraftData = {
+                icao24,
+                callsign,
+                flightNo,
+                lat,
+                lon,
+                registration,
+                type,
+                airline,
+                origin,
+                destination,
+                firstSeen:
+                  reusablePrev?.data.firstSeen ||
+                  now
+              };
+
+              lastSeenMap.set(
+                icao24,
+                {
+                  timestamp:
+                    now,
+                  data:
+                    aircraftData
+                }
+              );
+
+              if (isNewFlightOccurrence) {
+                logFlightSnapshot(
+                  aircraftData
+                );
+
+                console.log(
+                  `[FlightTrack] Logged ${flightNo || callsign || icao24.toUpperCase()} to analytics`
+                );
+              }
+            }
+          )
+        );
+
+        try {
+          if (
+            newAirportLines.length
+          ) {
+            fs.appendFileSync(
+              AIRPORTS_FILE,
+              newAirportLines
+                .join('\n') +
+                '\n',
+              'utf8'
+            );
+
+            console.log(
+              `[Airports] Logged ${newAirportLines.length} new airports`
+            );
+          }
+        } catch (err) {
+          console.error(
+            '[Airports] Failed to write airports file:',
+            err.message
+          );
+        }
+
+        try {
+          if (
+            newUnknownFlights.length
+          ) {
+            fs.appendFileSync(
+              UNKNOWN_AIRLINES_FILE,
+              newUnknownFlights
+                .join('\n') +
+                '\n',
+              'utf8'
+            );
+
+            console.log(
+              `[UnknownAirlines] Logged ${newUnknownFlights.length} unknown flights`
+            );
+          }
+        } catch (err) {
+          console.error(
+            '[UnknownAirlines] Failed to write unknown airlines file:',
+            err.message
+          );
+        }
+    return buildTrafficPayload(now);
+  })();
+
+  try {
+    return await trackingRefreshPromise;
+  } finally {
+    trackingRefreshPromise = null;
+  }
+}
+
+async function runBackgroundTrackingLoop() {
+  if (backgroundTrackingStopped) return;
+
+  try {
+    await refreshTrackingSnapshot();
+  } catch (err) {
+    console.error(
+      '[FlightTrack] Background tracking refresh failed:',
+      err?.message || err
+    );
+  } finally {
+    if (!backgroundTrackingStopped) {
+      const delayMs = Math.max(
+        5,
+        Number(appSettings.poll_interval_seconds) || 15
+      ) * 1000;
+
+      backgroundTrackingTimer = setTimeout(
+        runBackgroundTrackingLoop,
+        delayMs
+      );
+
+      backgroundTrackingTimer.unref?.();
+    }
+  }
+}
+
 // -----------------------------
 // HTTP Server
 // -----------------------------
@@ -2515,431 +2975,21 @@ const server =
             '/api/traffic'
           )
         ) {
-          const now =
-            Date.now();
-
-          const box =
-            bboxAround(
-              appSettings.lat,
-              appSettings.lon,
-              appSettings.radius_km
-            );
-
-          let states = [];
-
-          try {
-            states =
-              await getOpenSkyStates(
-                box
-              );
-          } catch (err) {
-            console.error(
-              'OpenSky fetch failed:',
-              err.message
-            );
-          }
-
-          const newAirportLines =
-            [];
-
-          const newUnknownFlights =
-            [];
-
-          await Promise.all(
-            states.map(
-              async s => {
-                if (
-                  s[5] == null ||
-                  s[6] == null
-                ) {
-                  return;
-                }
-
-                if (
-                  haversineKm(
-                    appSettings.lat,
-                    appSettings.lon,
-                    s[6],
-                    s[5]
-                  ) >
-                  appSettings.radius_km
-                ) {
-                  return;
-                }
-
-                const icao24 =
-                  s[0]
-                    ?.toLowerCase() ||
-                  '';
-
-                const callsign =
-                  (
-                    s[1] || ''
-                  ).trim();
-
-                const lat =
-                  s[6];
-
-                const lon =
-                  s[5];
-
-                const prev =
-                  lastSeenMap.get(
-                    icao24
-                  );
-
-                const flightNo =
-                  callsign.length > 2
-                    ? callsign.replace(/\s+/g, '')
-                    : null;
-
-                // lastSeenMap is keyed by aircraft ICAO24, but an aircraft can
-                // operate several different flights within the retention window.
-                // Treat a changed callsign, or the same aircraft returning after
-                // a meaningful absence, as a new flight occurrence.
-                const currentFlightKey = normaliseCallsign(flightNo || callsign);
-                const previousFlightKey = normaliseCallsign(
-                  prev?.data?.flightNo || prev?.data?.callsign || ''
-                );
-                const callsignChanged = Boolean(
-                  prev &&
-                  currentFlightKey &&
-                  previousFlightKey &&
-                  currentFlightKey !== previousFlightKey
-                );
-                const returnedAfterGap = Boolean(
-                  prev &&
-                  now - prev.timestamp >= NEW_FLIGHT_GAP_MS
-                );
-                const isNewFlightOccurrence = Boolean(
-                  !prev || callsignChanged || returnedAfterGap
-                );
-                const reusablePrev = isNewFlightOccurrence ? null : prev;
-
-                if (prev && isNewFlightOccurrence) {
-                  const reason = callsignChanged
-                    ? `${previousFlightKey || 'unknown'} -> ${currentFlightKey || 'unknown'}`
-                    : `${Math.round((now - prev.timestamp) / 60000)} min gap`;
-                  console.log(
-                    `[FlightTrack] New flight occurrence for ${icao24.toUpperCase()}: ${reason}`
-                  );
-                }
-
-                const acMeta =
-                  aircraftDb[icao24] ||
-                  {};
-
-                const specialTask = getAustralianSpecialTaskCallsign(flightNo);
-
-                let airline = specialTask
-                  ? { name: specialTask.label, logo: null }
-                  : null;
-                let origin = 'Unknown';
-                let destination = 'Unknown';
-
-                let registration =
-                  acMeta.registration ||
-                  acMeta.Registration ||
-                  null;
-
-                let type =
-                  friendlyAircraftType({
-                    adsbType: null,
-                    adsbIcaoType: null,
-                    localMeta: acMeta
-                  });
-
-                if (flightNo && (!reusablePrev || reusablePrev.data.origin === 'Unknown' || reusablePrev.data.destination === 'Unknown')) {
-                  const adsbData = await lookupAdsbdb(icao24, flightNo);
-
-                  if (adsbData) {
-                    registration =
-                      adsbData.registration ||
-                      registration;
-
-                    type =
-                      friendlyAircraftType({
-                        adsbType:
-                          adsbData.type,
-                        adsbIcaoType:
-                          adsbData.icaoType,
-                        localMeta:
-                          acMeta
-                      }) ||
-                      type;
-
-                    origin = formatAdsbAirport(adsbData.origin);
-                    destination = formatAdsbAirport(adsbData.destination);
-
-                    if (adsbData.airline?.name) {
-                      airline = {
-                        name: adsbData.airline.name,
-                        logo: airlineMap[adsbData.airline.icao]?.logo || null
-                      };
-                    }
-                  }
-                }
-
-                // Personal-only fallback for any callsign whose route ADSBDB
-                // cannot safely resolve. This deliberately includes Australian
-                // AM ambulance callsigns: ADSBDB route lookup is skipped for those
-                // because AM235 can collide with Aeromexico, but FlightAware's
-                // exact /live/flight/AM235 page can still provide the real route.
-                if (
-                  flightNo &&
-                  (origin === 'Unknown' || destination === 'Unknown')
-                ) {
-                  const scrapedRoute = await lookupFlightAwareScrape(flightNo);
-                  if (scrapedRoute) {
-                    if (origin === 'Unknown') {
-                      origin = formatAdsbAirport(scrapedRoute.origin);
-                    }
-                    if (destination === 'Unknown') {
-                      destination = formatAdsbAirport(scrapedRoute.destination);
-                    }
-                  }
-                }
-
-                if (reusablePrev) {
-                  // Never let a previous literal "Unknown" erase a newly resolved
-                  // route. Re-use previous route values only when the current pass
-                  // is still unknown and the previous pass actually knew the value.
-                  if (
-                    origin === 'Unknown' &&
-                    reusablePrev.data.origin &&
-                    reusablePrev.data.origin !== 'Unknown'
-                  ) {
-                    origin = reusablePrev.data.origin;
-                  }
-
-                  if (
-                    destination === 'Unknown' &&
-                    reusablePrev.data.destination &&
-                    reusablePrev.data.destination !== 'Unknown'
-                  ) {
-                    destination = reusablePrev.data.destination;
-                  }
-
-                  registration = registration || reusablePrev.data.registration;
-                  type = type || reusablePrev.data.type;
-                  airline = airline || reusablePrev.data.airline;
-                }
-
-                // A previous cached aircraft state must never override the
-                // special-task label with a commercial airline match.
-                if (specialTask) {
-                  airline = { name: specialTask.label, logo: null };
-                }
-
-                if (!airline && callsign.length >= 3) {
-                  const code = callsign.slice(0, 3).toUpperCase();
-                  if (airlineMap[code]) {
-                    airline = {
-                      name: airlineMap[code].name,
-                      logo: airlineMap[code].logo
-                    };
-                  }
-                }
-
-                const oa =
-                  makeAirportLine(
-                    origin
-                  );
-
-                if (
-                  oa &&
-                  oa.code &&
-                  oa.code !==
-                    'UNK' &&
-                  !loggedAirports.has(
-                    oa.code
-                  )
-                ) {
-                  loggedAirports.add(
-                    oa.code
-                  );
-
-                  newAirportLines.push(
-                    oa.line
-                  );
-                }
-
-                const da =
-                  makeAirportLine(
-                    destination
-                  );
-
-                if (
-                  da &&
-                  da.code &&
-                  da.code !==
-                    'UNK' &&
-                  !loggedAirports.has(
-                    da.code
-                  )
-                ) {
-                  loggedAirports.add(
-                    da.code
-                  );
-
-                  newAirportLines.push(
-                    da.line
-                  );
-                }
-
-                if (
-                  !airline ||
-                  !airline.name
-                ) {
-                  if (
-                    flightNo &&
-                    !loggedUnknownAirlines.has(
-                      flightNo
-                    )
-                  ) {
-                    loggedUnknownAirlines.add(
-                      flightNo
-                    );
-
-                    newUnknownFlights.push(
-                      flightNo
-                    );
-                  }
-                }
-
-                const aircraftData = {
-                  icao24,
-                  callsign,
-                  flightNo,
-                  lat,
-                  lon,
-                  registration,
-                  type,
-                  airline,
-                  origin,
-                  destination,
-                  firstSeen:
-                    reusablePrev?.data.firstSeen ||
-                    now
-                };
-
-                lastSeenMap.set(
-                  icao24,
-                  {
-                    timestamp:
-                      now,
-                    data:
-                      aircraftData
-                  }
-                );
-
-                if (isNewFlightOccurrence) {
-                  logFlightSnapshot(
-                    aircraftData
-                  );
-                }
-              }
-            )
-          );
-
-          try {
-            if (
-              newAirportLines.length
-            ) {
-              fs.appendFileSync(
-                AIRPORTS_FILE,
-                newAirportLines
-                  .join('\n') +
-                  '\n',
-                'utf8'
-              );
-
-              console.log(
-                `[Airports] Logged ${newAirportLines.length} new airports`
-              );
-            }
-          } catch (err) {
-            console.error(
-              '[Airports] Failed to write airports file:',
-              err.message
-            );
-          }
-
-          try {
-            if (
-              newUnknownFlights.length
-            ) {
-              fs.appendFileSync(
-                UNKNOWN_AIRLINES_FILE,
-                newUnknownFlights
-                  .join('\n') +
-                  '\n',
-                'utf8'
-              );
-
-              console.log(
-                `[UnknownAirlines] Logged ${newUnknownFlights.length} unknown flights`
-              );
-            }
-          } catch (err) {
-            console.error(
-              '[UnknownAirlines] Failed to write unknown airlines file:',
-              err.message
-            );
-          }
-
-          const result = [];
-
-          for (
-            const [
-              icao,
-              info
-            ]
-            of lastSeenMap.entries()
-          ) {
-            if (
-              now -
-                info.timestamp <=
-              KEEP_ALIVE_MS
-            ) {
-              result.push(
-                info.data
-              );
-            } else {
-              lastSeenMap.delete(
-                icao
-              );
-            }
-          }
+          // The browser is now a reader only. Background tracking continues
+          // even when nobody has this page open.
+          const payload = buildTrafficPayload();
 
           res.writeHead(200, {
             'content-type':
-              'application/json'
+              'application/json',
+            'cache-control':
+              'no-store'
           });
 
           res.end(
-            JSON.stringify({
-              centre: {
-                lat: appSettings.lat,
-                lon: appSettings.lon
-              },
-              radius_km:
-                appSettings.radius_km,
-              poll_interval_seconds:
-                appSettings.poll_interval_seconds,
-              display_timezone:
-                appSettings.display_timezone,
-              server_time: {
-                epoch_ms: Date.now(),
-                timezone: appSettings.display_timezone,
-                minutes_since_midnight:
-                  minutesSinceMidnightInTimeZone(appSettings.display_timezone)
-              },
-              count:
-                result.length,
-              aircraft:
-                result
-            })
+            JSON.stringify(
+              payload
+            )
           );
 
           return;
@@ -3115,10 +3165,23 @@ const server =
 
 server.listen(
   PORT,
-  () =>
+  () => {
     console.log(
       `Server running at http://localhost:${PORT}`
-    )
+    );
+
+    console.log(
+      `[FlightTrack] Background tracking enabled; polling OpenSky every ${appSettings.poll_interval_seconds}s`
+    );
+
+    // Give startup logging and file loading a moment to settle, then begin
+    // tracking whether or not a browser is connected.
+    backgroundTrackingTimer = setTimeout(
+      runBackgroundTrackingLoop,
+      1000
+    );
+    backgroundTrackingTimer.unref?.();
+  }
 );
 
 // -----------------------------
@@ -3126,6 +3189,12 @@ server.listen(
 // -----------------------------
 function shutdown(signal) {
   console.log(`[Shutdown] ${signal} received`);
+
+  backgroundTrackingStopped = true;
+  if (backgroundTrackingTimer) {
+    clearTimeout(backgroundTrackingTimer);
+    backgroundTrackingTimer = null;
+  }
 
   server.close(err => {
     if (err) {
