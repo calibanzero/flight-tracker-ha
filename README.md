@@ -28,9 +28,9 @@ Updating
 
 git pull
 
-docker compose down
+docker compose -f compose.local.yaml down
 
-docker compose up -d --build
+docker compose -f compose.local.yaml up -d --build
 
 
 Home Assistant
