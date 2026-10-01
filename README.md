@@ -25,9 +25,14 @@ To configure:
 http://YOUR-SERVER-IP:3002/admin
 
 Updating
+
 git pull
+
 docker compose down
+
 docker compose up -d --build
+
+
 Home Assistant
 
 Add the Flight Tracker page to a Home Assistant dashboard using a Webpage card:
