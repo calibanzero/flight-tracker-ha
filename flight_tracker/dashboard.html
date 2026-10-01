@@ -104,7 +104,7 @@
       text-transform: uppercase;
     }
 
-    input[type="date"] {
+    input[type="date"], select {
       min-width: 158px;
       padding: 10px 12px;
       color: var(--text);
@@ -116,7 +116,7 @@
       outline: none;
       background: rgba(2, 8, 23, .72);
     }
-    input[type="date"]:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(34,211,238,.12); }
+    input[type="date"]:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(34,211,238,.12); }
 
     .range-buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-left: 2px; }
 
@@ -288,6 +288,12 @@
         <label for="toDate">To</label>
         <input type="date" id="toDate">
       </div>
+      <div class="date-field">
+        <label for="airportSelect">Airport</label>
+        <select id="airportSelect" aria-label="Route airport">
+          <option value="SYD">SYD</option>
+        </select>
+      </div>
       <div class="range-buttons" aria-label="Quick date ranges">
         <button class="range-button" data-days="1">Today</button>
         <button class="range-button" data-days="7">7 days</button>
@@ -366,6 +372,22 @@
         <div class="chart-wrap"><canvas id="byAirlineChart"></canvas></div>
       </article>
 
+      <article class="card span-6">
+        <div class="card-header">
+          <div><h2 id="fromAirportTitle">Flying from SYD</h2><p>Most common destinations in the selected range</p></div>
+          <span class="badge">Top 10</span>
+        </div>
+        <div class="chart-wrap"><canvas id="fromAirportChart"></canvas></div>
+      </article>
+
+      <article class="card span-6">
+        <div class="card-header">
+          <div><h2 id="toAirportTitle">Flying to SYD</h2><p>Most common origins in the selected range</p></div>
+          <span class="badge">Top 10</span>
+        </div>
+        <div class="chart-wrap"><canvas id="toAirportChart"></canvas></div>
+      </article>
+
       <article class="card span-12">
         <div class="card-header">
           <div><h2>15-minute traffic profile</h2><p>A finer look at the noisy bits of the day</p></div>
@@ -437,10 +459,11 @@
       });
     }
 
-    async function fetchStats(fromDate, toDate) {
+    async function fetchStats(fromDate, toDate, airport) {
       const params = new URLSearchParams();
       if (fromDate) params.set('from', fromDate);
       if (toDate) params.set('to', toDate);
+      if (airport) params.set('airport', airport);
       const res = await fetch(params.size ? `/api/stats?${params}` : '/api/stats', { cache: 'no-store' });
       if (!res.ok) throw new Error(`Stats request failed (${res.status})`);
       return res.json();
@@ -511,6 +534,11 @@
       const dayEntries = Object.entries(data.flightsPerDay || {}).sort((a, b) => a[0].localeCompare(b[0]));
       const topTypes = topN(data.flightsByAircraft, 10);
       const topAirlines = topN(data.flightsByAirline, 10);
+      const topRoutesFrom = topN(data.routesFromAirport, 10);
+      const topRoutesTo = topN(data.routesToAirport, 10);
+      const selectedAirport = data.selectedAirport || 'SYD';
+      document.getElementById('fromAirportTitle').textContent = `Flying from ${selectedAirport}`;
+      document.getElementById('toAirportTitle').textContent = `Flying to ${selectedAirport}`;
 
       makeChart('day', 'byDayChart', {
         type: 'line',
@@ -579,6 +607,32 @@
           }
         }
       });
+
+      makeChart('routesFrom', 'fromAirportChart', {
+        type: 'bar',
+        data: { labels: topRoutesFrom.map(([k]) => k), datasets: [{ label: 'Flights', data: topRoutesFrom.map(([, v]) => v), backgroundColor: colours.cyan, borderRadius: 5, borderSkipped: false }] },
+        options: {
+          indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { beginAtZero: true, grid: { color: colours.grid }, ticks: { color: colours.muted, precision: 0 } },
+            y: { grid: { display: false }, ticks: { color: colours.text } }
+          }
+        }
+      });
+
+      makeChart('routesTo', 'toAirportChart', {
+        type: 'bar',
+        data: { labels: topRoutesTo.map(([k]) => k), datasets: [{ label: 'Flights', data: topRoutesTo.map(([, v]) => v), backgroundColor: colours.purple, borderRadius: 5, borderSkipped: false }] },
+        options: {
+          indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { beginAtZero: true, grid: { color: colours.grid }, ticks: { color: colours.muted, precision: 0 } },
+            y: { grid: { display: false }, ticks: { color: colours.text } }
+          }
+        }
+      });
     }
 
     async function initDashboard() {
@@ -587,9 +641,23 @@
       const applyBtn = document.getElementById('applyDates');
       const status = document.getElementById('status');
       const timezoneBadge = document.getElementById('timezoneBadge');
+      const airportSelect = document.getElementById('airportSelect');
       const rangeButtons = [...document.querySelectorAll('.range-button')];
       let analyticsTimeZone = await fetchLocalTimezone();
       timezoneBadge.textContent = analyticsTimeZone;
+      const savedAirport = (localStorage.getItem('analyticsAirport') || 'SYD').toUpperCase();
+      airportSelect.value = savedAirport;
+
+      function populateAirports(airports, selected) {
+        const items = Array.isArray(airports) ? airports : [];
+        const codes = new Set(items.map(a => a.code));
+        if (!codes.has(selected)) items.unshift({ code: selected, details: '' });
+        airportSelect.innerHTML = items
+          .sort((a, b) => a.code.localeCompare(b.code))
+          .map(a => `<option value="${a.code}">${a.code}${a.details ? ` - ${a.details}` : ''}</option>`)
+          .join('');
+        airportSelect.value = selected;
+      }
 
       function setRange(days) {
         const today = dateStringInTimeZone(new Date(), analyticsTimeZone);
@@ -618,7 +686,8 @@
         status.className = 'status';
 
         try {
-          const data = await fetchStats(fromInput.value, toInput.value);
+          const data = await fetchStats(fromInput.value, toInput.value, airportSelect.value || 'SYD');
+          populateAirports(data.availableAirports, data.selectedAirport || airportSelect.value || 'SYD');
           if (data.timezone) {
             analyticsTimeZone = data.timezone;
             timezoneBadge.textContent = analyticsTimeZone;
@@ -650,6 +719,10 @@
 
       [fromInput, toInput].forEach(input => input.addEventListener('change', () => markActive('manual')));
       applyBtn.addEventListener('click', load);
+      airportSelect.addEventListener('change', () => {
+        localStorage.setItem('analyticsAirport', airportSelect.value);
+        load();
+      });
       document.addEventListener('keydown', event => {
         if (event.key === 'Enter' && (document.activeElement === fromInput || document.activeElement === toInput)) load();
       });

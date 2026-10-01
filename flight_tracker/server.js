@@ -3004,7 +3004,12 @@ const server =
             const urlObj = new URL(req.url, 'http://localhost');
             const fromParam = urlObj.searchParams.get('from');
             const toParam = urlObj.searchParams.get('to');
+            const airportParam = String(urlObj.searchParams.get('airport') || 'SYD').trim().toUpperCase();
             const validDateParam = value => !value || /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+            if (!/^[A-Z0-9]{3,4}$/.test(airportParam)) {
+              throw new Error('Airport filter must be a 3 or 4 character airport code');
+            }
 
             if (!validDateParam(fromParam) || !validDateParam(toParam)) {
               throw new Error('Date filters must use YYYY-MM-DD');
@@ -3022,7 +3027,11 @@ const server =
               byQuarterHour: Array.from({ length: 96 }, () => 0),
               flightsByAircraft: {},
               flightsByAirline: {},
-              flightsPerDay: {}
+              flightsPerDay: {},
+              selectedAirport: airportParam,
+              availableAirports: getKnownAirports(),
+              routesFromAirport: {},
+              routesToAirport: {}
             });
 
             if (!fs.existsSync(FLIGHT_LOG_FILE)) {
@@ -3073,6 +3082,19 @@ const server =
               stats.flightsByAirline[airline] = (stats.flightsByAirline[airline] || 0) + 1;
 
               stats.flightsPerDay[dayKey] = (stats.flightsPerDay[dayKey] || 0) + 1;
+
+              const originAirport = makeAirportLine(r.origin);
+              const destinationAirport = makeAirportLine(r.destination);
+
+              if (originAirport?.code === airportParam && destinationAirport?.code && destinationAirport.code !== 'UNK') {
+                stats.routesFromAirport[destinationAirport.code] =
+                  (stats.routesFromAirport[destinationAirport.code] || 0) + 1;
+              }
+
+              if (destinationAirport?.code === airportParam && originAirport?.code && originAirport.code !== 'UNK') {
+                stats.routesToAirport[originAirport.code] =
+                  (stats.routesToAirport[originAirport.code] || 0) + 1;
+              }
             });
 
             res.writeHead(200, { 'content-type': 'application/json' });
